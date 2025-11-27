@@ -1,0 +1,5 @@
+{
+  "name": "MAGI System Simulator",
+  "description": "A tri-personality decision support system inspired by EVA. It simulates Melchior (Science), Balthasar (Mother), and Casper (Woman) to analyze problems from logical, protective, and intuitive perspectives.",
+  "requestFramePermissions": []
+}

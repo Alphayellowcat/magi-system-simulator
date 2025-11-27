@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MAGI System Simulator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              magi: {
+                bg: '#050505',
+                panel: '#151515',
+                text: '#ececec', // Off-white for general text
+                melchior: '#00ff9d', // Teal
+                balthasar: '#ff9900', // Orange
+                casper: '#ff0055', // Pink/Red
+                dim: '#666666', // Lighter grey for better visibility
+                grid: '#333333', // More visible borders
+              }
+            },
+            fontFamily: {
+              mono: ['"Courier New"', 'Courier', 'monospace'],
+              display: ['Impact', 'Arial Black', 'sans-serif'],
+            },
+            backgroundImage: {
+              'hex-pattern': 'radial-gradient(#222 1px, transparent 1px)',
+              'pattern-diagonal-lines': 'repeating-linear-gradient(45deg, #000 0, #000 10px, #111 10px, #111 20px)',
+            },
+            backgroundSize: {
+              'hex-pattern': '20px 20px',
+            },
+            animation: {
+              'blink': 'blink 1s step-end infinite',
+              'scan-vertical': 'scanVertical 3s linear infinite',
+              'flash': 'flash 0.5s ease-in-out',
+            },
+            keyframes: {
+              blink: {
+                '0%, 100%': { opacity: '1' },
+                '50%': { opacity: '0' },
+              },
+              scanVertical: {
+                '0%': { transform: 'translateY(-100%)' },
+                '100%': { transform: 'translateY(100%)' },
+              },
+              flash: {
+                '0%, 100%': { opacity: '1' },
+                '50%': { opacity: '0.5' },
+              }
+            }
+          },
+        },
+      }
+    </script>
+    <style>
+      body {
+        background-color: #050505;
+        color: #e5e5e5;
+        overflow: hidden; 
+      }
+      .text-shadow-glow {
+        text-shadow: 0 0 5px currentColor;
+      }
+      /* Custom Scrollbar - Cleaner look */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #0a0a0a;
+        border-left: 1px solid #222;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #444;
+        border: 1px solid #111;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #666; 
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
+    "uuid": "https://aistudiocdn.com/uuid@^13.0.0"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body class="bg-magi-bg bg-hex-pattern h-screen w-screen overflow-hidden">
+    <div id="root" class="h-full w-full"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
