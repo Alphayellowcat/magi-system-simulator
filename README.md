@@ -1,5 +1,5 @@
 <div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+<img width="1200" height="475" alt="MAGI System Banner" src="public/images/magi_banner.png" />
 </div>
 
 # MAGI 系统模拟器
@@ -21,21 +21,9 @@
 2. **意识整合**: 第四个AI调用基于三者的输出进行最终决策
 3. **涌现智慧**: 最终YES/NO从潜意识整合中自然涌现
 
-## 🎭 EVA-MAGI 彩蛋协议
+## 📚 协议文档
 
-系统内置了受《EVA》和《少数派报告》启发的特殊决策规则：
-
-- **🔴 双重否决**: MELCHIOR + BALTHASAR同时反对时，默认否定（除非CASPER有压倒性预知证据）
-- **🟡 偏见检测**: CASPER同意但MELCHIOR反对时，标记潜在情感操纵
-- **🟢 绝对共识**: 三个原型全部同意时，必须批准（三重共识不可否认）
-
-*"The three must agree, or the answer is no." - Gendo Ikari*
-
-## 🛡️ 系统加固特性
-
-- **JSON防御系统**: 自动清理和验证模型输出，防止解析错误
-- **超时熔断机制**: 45秒超时保护，防止单个人格调用卡死
-- **母亲否决权**: BALTHASAR拥有对未来五年潜在伤害的绝对否决权
+关于系统的详细决策协议（如双重否决、母亲否决权等）及彩蛋设定，请参阅 [协议文档](docs/protocols.md)。
 
 ## 本地运行
 
