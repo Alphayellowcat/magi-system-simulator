@@ -11,6 +11,11 @@ node_modules
 dist
 dist-ssr
 *.local
+magi.bridge.json
+magi.mcp.json
+.magi/state/
+.magi/config/bridge.json
+.magi/mcp/servers.json
 
 # Editor directories and files
 .vscode/*
