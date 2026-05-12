@@ -127,7 +127,7 @@ export const createInitialHarnessDocuments = (): HarnessDocuments =>
     return acc;
   }, {} as HarnessDocuments);
 
-const normalizeDocuments = (documents: Partial<HarnessDocuments>): HarnessDocuments => {
+export const normalizeHarnessDocuments = (documents: Partial<HarnessDocuments>): HarnessDocuments => {
   const initial = createInitialHarnessDocuments();
 
   HARNESS_DOCUMENT_DEFINITIONS.forEach(definition => {
@@ -146,9 +146,18 @@ const normalizeDocuments = (documents: Partial<HarnessDocuments>): HarnessDocume
 };
 
 const migrateHarnessDocument = (id: HarnessDocumentId, content: string) => {
-  if (id !== 'registry.tools') return content;
+  let next = content
+    .replace(/magi\.mcp\.example\.json/g, '.magi/mcp/servers.example.json')
+    .replace(/magi\.mcp\.json/g, '.magi/mcp/servers.json')
+    .replace(/magi\.bridge\.json/g, '.magi/config/bridge.json')
+    .replace(/无MCP filesystem服务器/g, 'filesystem MCP 状态以 Runtime Tool Manifest 为准')
+    .replace(/本体代码不可见（filesystem MCP 状态以 Runtime Tool Manifest 为准）/g, '本体代码可见性以 Runtime Tool Manifest 为准；若 filesystem MCP 在线，应通过 mcp.call 读取')
+    .replace(/本体代码不可见/g, '本体代码可见性以 Runtime Tool Manifest 为准')
+    .replace(/MCP桥接状态待确认/g, 'MCP 桥接状态应以 Runtime Tool Manifest 为准');
 
-  return content
+  if (id !== 'registry.tools') return next;
+
+  return next
     .replace(/status: planned/g, 'status: implemented-local-bridge')
     .replace(/MELCHIOR-1:mcp\.call=plan/g, 'MELCHIOR-1:mcp.call=allow')
     .replace(/MELCHIOR-1:skill\.run=plan/g, 'MELCHIOR-1:skill.run=allow')
@@ -160,7 +169,7 @@ const migrateHarnessDocument = (id: HarnessDocumentId, content: string) => {
 
 export const loadHarnessDocuments = async (): Promise<HarnessDocuments> => {
   const saved = loadLocalState<Partial<HarnessDocuments> | null>('documents', null);
-  if (saved) return normalizeDocuments(saved);
+  if (saved) return normalizeHarnessDocuments(saved);
 
   const documents = createInitialHarnessDocuments();
 

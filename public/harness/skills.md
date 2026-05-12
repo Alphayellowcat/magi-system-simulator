@@ -23,10 +23,10 @@ skill-name/
 - Read `SKILL.md` first. Load referenced files narrowly.
 - Prefer bundled scripts and assets over rewriting large logic.
 - Skills may add tools or workflows, but they do not automatically grant execution permission.
-- The local bridge can execute `skill.run` in `load` mode immediately. `script` mode requires `allowSkillScripts: true` in `magi.bridge.json`.
+- The local bridge can execute `skill.run` in `load` mode immediately. `script` mode requires `allowSkillScripts: true` in `.magi/config/bridge.json`.
 
 ## Installed Skill Slots
 
-- harness-engineering: discoverable-through-bridge
-- mcp-tool-authoring: discoverable-through-bridge
-- browser-verification: discoverable-through-bridge
+- harness-engineering: project-local `.magi/skills/harness-engineering/SKILL.md`
+- mcp-tool-authoring: project-local `.magi/skills/mcp-tool-authoring/SKILL.md`
+- browser-verification: project-local `.magi/skills/browser-verification/SKILL.md`

@@ -9,6 +9,7 @@ import {
   createInitialHarnessDocuments,
   loadHarnessDocuments,
   loadHarnessSettings,
+  normalizeHarnessDocuments,
   saveHarnessDocuments,
   saveHarnessSettings,
 } from './services/harnessService';
@@ -83,7 +84,7 @@ const App: React.FC = () => {
       setSessions(sessionState.value);
       setMemories(memoryState.value);
       setHarnessSettings(settingsState.value);
-      setHarnessDocuments(documentState.value);
+      setHarnessDocuments(normalizeHarnessDocuments(documentState.value));
       setHarnessReady(true);
     };
 

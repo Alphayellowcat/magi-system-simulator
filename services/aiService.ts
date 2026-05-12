@@ -25,7 +25,7 @@ import {
   getPersonaMemoryDocumentId,
   hasToolPermission,
 } from './harnessService';
-import { executeBridgeTool } from './bridgeService';
+import { BridgeSkill, BridgeStatus, executeBridgeTool, getBridgeStatus, listMcpTools } from './bridgeService';
 
 interface MagiHarnessContext {
   settings: HarnessSettings;
@@ -63,6 +63,30 @@ interface ToolRiskAssessment {
   risk: PendingActionRisk;
   requiresApproval: boolean;
   summary: string;
+}
+
+interface RuntimeMcpTool {
+  name: string;
+  title?: string;
+  description?: string;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+  };
+  inputSchema?: unknown;
+}
+
+interface RuntimeMcpServerTools {
+  server: string;
+  tools: RuntimeMcpTool[];
+  error?: string;
+}
+
+interface RuntimeCapabilities {
+  bridge?: BridgeStatus;
+  mcpServers: RuntimeMcpServerTools[];
+  errors: string[];
 }
 
 const systemConfigs: Record<MagiSystem, SystemConfig> = {
@@ -404,6 +428,243 @@ const formatMeetingTranscript = (meeting: CouncilExchange[]) =>
     ).join('\n\n')
     : 'NO MEETING TRANSCRIPT.';
 
+const extractMcpTools = (payload: unknown): RuntimeMcpTool[] => {
+  if (!payload || typeof payload !== 'object') return [];
+  const candidate = payload as {
+    result?: { tools?: RuntimeMcpTool[] };
+    tools?: RuntimeMcpTool[];
+  };
+  if (Array.isArray(candidate.result?.tools)) return candidate.result.tools;
+  if (Array.isArray(candidate.tools)) return candidate.tools;
+  return [];
+};
+
+const shouldExpandRuntimeManifest = (userQuery: string) =>
+  /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|浏览|网页|搜索|联网|readme|repo|repository|source|file|directory|codebase|filesystem|mcp|tool|工具|skill|技能|能力|browser|web|search/.test(userQuery.toLowerCase());
+
+const loadRuntimeCapabilities = async (
+  onEvent?: QueryMagiOptions['onEvent'],
+  includeMcpTools = false,
+): Promise<RuntimeCapabilities> => {
+  const streamEvents: StreamEvent[] = [];
+  const emit = (
+    phase: string,
+    actor: string,
+    status: StreamEvent['status'],
+    message: string,
+    details?: string,
+  ) => emitStreamEvent(streamEvents, onEvent, phase, actor, status, message, details);
+
+  try {
+    emit('runtime', 'BRIDGE', 'running', 'Checking local harness bridge.');
+    const bridge = await getBridgeStatus();
+    emit(
+      'runtime',
+      'BRIDGE',
+      bridge.ok ? 'complete' : 'failed',
+      bridge.ok
+        ? `Bridge online; ${bridge.skills.length} skill(s), ${bridge.mcpServers.length} MCP server(s).`
+        : 'Bridge status returned not ok.',
+    );
+
+    const mcpServers = includeMcpTools
+      ? await Promise.all((bridge.mcpServers || []).map(async server => {
+      try {
+        const result = await listMcpTools(server);
+        const tools = extractMcpTools(result);
+        emit('runtime', `MCP:${server}`, 'complete', `${tools.length} tool(s) discovered.`);
+        return { server, tools };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'MCP tools/list failed.';
+        emit('runtime', `MCP:${server}`, 'failed', message);
+        return { server, tools: [], error: message };
+      }
+    }))
+      : (bridge.mcpServers || []).map(server => ({ server, tools: [] }));
+
+    return {
+      bridge,
+      mcpServers,
+      errors: [],
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Bridge status unavailable.';
+    emit('runtime', 'BRIDGE', 'failed', message);
+    return {
+      mcpServers: [],
+      errors: [message],
+    };
+  }
+};
+
+const compactSkill = (skill: BridgeSkill) => {
+  const description = truncateForPrompt(skill.description || 'No description.', 220).replace(/\s+/g, ' ');
+  return `- ${skill.id}: ${description}`;
+};
+
+const compactMcpTool = (tool: RuntimeMcpTool) => {
+  const flags = [
+    tool.annotations?.readOnlyHint ? 'readOnly' : '',
+    tool.annotations?.destructiveHint ? 'destructive' : '',
+    tool.annotations?.idempotentHint ? 'idempotent' : '',
+  ].filter(Boolean).join(',');
+  const description = truncateForPrompt(tool.description || tool.title || 'No description.', 220).replace(/\s+/g, ' ');
+  return `- ${tool.name}${flags ? ` [${flags}]` : ''}: ${description}`;
+};
+
+const formatRuntimeCapabilities = (runtime: RuntimeCapabilities, expanded: boolean) => {
+  const bridge = runtime.bridge;
+  const bridgeLine = bridge?.ok
+    ? `ONLINE. cwd=${bridge.cwd}; skillScripts=${bridge.allowSkillScripts ? 'enabled' : 'disabled'}; config=${bridge.bridgeConfigPath || 'default'}; mcpConfig=${bridge.mcpConfigPath || 'none'}`
+    : `OFFLINE or unavailable. ${runtime.errors.join('; ') || 'No bridge status.'}`;
+
+  const skills = bridge?.skills?.length
+    ? expanded
+      ? bridge.skills.slice(0, 30).map(compactSkill).join('\n')
+      : `Available skill ids: ${bridge.skills.map(skill => skill.id).slice(0, 40).join(', ')}`
+    : 'NO SKILLS DISCOVERED BY BRIDGE.';
+
+  const hasFilesystem = runtime.mcpServers.some(server => server.server === 'filesystem');
+  const toolUseRules = hasFilesystem
+    ? `- To inspect this repository or local code, request mcp.call against the filesystem server instead of asking the user to configure filesystem again.
+- Useful filesystem calls: list_allowed_directories {}, list_directory {"path":"."}, directory_tree {"path":".","excludePatterns":["node_modules","dist",".git",".magi/state"]}, search_files {"path":".","pattern":"**/*.ts"}, read_text_file {"path":"App.tsx","head":200}.
+- Mutating filesystem tools such as write_file, edit_file, move_file, create_directory require user approval.`
+    : '- No filesystem MCP server is currently listed by the bridge. Do not claim local file access unless a filesystem server appears in the manifest.';
+
+  const mcpServers = runtime.mcpServers.length
+    ? runtime.mcpServers.map(server => {
+      const tools = expanded && server.tools.length
+        ? server.tools.slice(0, 24).map(compactMcpTool).join('\n')
+        : expanded
+          ? `- NO TOOLS LISTED${server.error ? `: ${server.error}` : '.'}`
+          : '- tool list not expanded for this prompt; planner may expand on file/MCP/tool tasks.';
+      return `### ${server.server}\n${tools}`;
+    }).join('\n\n')
+    : 'NO MCP SERVERS DISCOVERED BY BRIDGE.';
+
+  return `
+## Runtime Tool Manifest
+
+This block is host/runtime-provided capability context, analogous to Codex tool schemas. It supersedes stale memories or editable registry text.
+It is compact by default and expands MCP tool names only when the user task asks about local files, tools, MCP, skills, or code.
+Do not claim the browser sandbox prevents file inspection when the bridge is ONLINE and a filesystem MCP server is listed.
+
+Bridge: ${bridgeLine}
+
+## Runtime Skills Available via skill.run load
+${skills}
+
+## Runtime MCP Servers and Tools
+${mcpServers}
+
+## Tool-Use Rules From Runtime
+
+${toolUseRules}
+- To inspect a skill's instructions, request skill.run {"skill":"<runtime skill id>","mode":"load","task":"why the skill is needed"}.
+`;
+};
+
+const runtimeHasMcpTool = (
+  runtime: RuntimeCapabilities | undefined,
+  server: string,
+  toolName: string,
+) => Boolean(runtime?.mcpServers.find(item =>
+  item.server === server && item.tools.some(tool => tool.name === toolName),
+));
+
+const runtimeHasSkill = (
+  runtime: RuntimeCapabilities | undefined,
+  skillId: string,
+) => Boolean(runtime?.bridge?.skills.some(skill => skill.id.toLowerCase() === skillId.toLowerCase()));
+
+const appendUniqueToolRequest = (
+  requests: PlannedToolRequest[],
+  request: PlannedToolRequest,
+) => {
+  const key = JSON.stringify([request.toolId, request.arguments]);
+  if (!requests.some(item => JSON.stringify([item.toolId, item.arguments]) === key)) {
+    requests.push(request);
+  }
+};
+
+const suggestRuntimeToolRequests = (
+  systemType: MagiSystem,
+  userQuery: string,
+  runtime: RuntimeCapabilities | undefined,
+): PlannedToolRequest[] => {
+  const query = userQuery.toLowerCase();
+  const requests: PlannedToolRequest[] = [];
+  const asksAboutFiles = /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|readme|repo|repository|source|file|directory|codebase|filesystem|mcp/.test(query);
+  const asksAboutSkills = /skill|技能|能力包|加载|详情|instructions|skill\.md/.test(query);
+  const asksAboutBrowsing = /浏览|网页|搜索|联网|browser|web|search/.test(query);
+
+  if (asksAboutFiles && runtimeHasMcpTool(runtime, 'filesystem', 'directory_tree')) {
+    if (systemType === MagiSystem.MELCHIOR) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'mcp.call',
+        arguments: {
+          server: 'filesystem',
+          tool: 'directory_tree',
+          arguments: {
+            path: '.',
+            excludePatterns: ['node_modules', 'dist', '.git', '.magi/state'],
+          },
+        },
+        reason: 'The user is asking about local project/code capability; inspect the repository tree through filesystem MCP.',
+      });
+    }
+
+    if (systemType === MagiSystem.BALTHASAR && runtimeHasMcpTool(runtime, 'filesystem', 'list_allowed_directories')) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'mcp.call',
+        arguments: {
+          server: 'filesystem',
+          tool: 'list_allowed_directories',
+          arguments: {},
+        },
+        reason: 'Verify filesystem MCP allowed directories before making claims about local access.',
+      });
+    }
+  }
+
+  if (asksAboutSkills && runtime?.bridge?.skills?.length) {
+    const matchedSkill = runtime.bridge.skills.find(skill =>
+      query.includes(skill.id.toLowerCase()) ||
+      (skill.name && query.includes(skill.name.toLowerCase())),
+    );
+
+    if (matchedSkill && runtimeHasSkill(runtime, matchedSkill.id)) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'skill.run',
+        arguments: {
+          skill: matchedSkill.id,
+          task: 'Load the SKILL.md instructions so MAGI can describe and use this skill accurately.',
+          mode: 'load',
+        },
+        reason: `The user asked about skill details for ${matchedSkill.id}.`,
+      });
+    }
+  }
+
+  if (asksAboutBrowsing && runtime?.bridge?.skills?.length) {
+    const browserSkill = runtime.bridge.skills.find(skill => skill.id === 'browser') ||
+      runtime.bridge.skills.find(skill => skill.id === 'browser-verification');
+    if (browserSkill && runtimeHasSkill(runtime, browserSkill.id)) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'skill.run',
+        arguments: {
+          skill: browserSkill.id,
+          task: 'Load browser-related SKILL.md instructions so MAGI can describe current browser capability accurately.',
+          mode: 'load',
+        },
+        reason: `The user asked about browsing/search capability; inspect ${browserSkill.id}.`,
+      });
+    }
+  }
+
+  return requests.slice(0, 2);
+};
+
 const normalizeDocumentOperations = (
   rawOperations: unknown,
   allowedDocumentIds: Set<HarnessDocumentId>,
@@ -445,6 +706,7 @@ const buildPersonaHarness = (
   systemType: MagiSystem,
   documents: HarnessDocuments,
   legacyMemoryStr: string,
+  runtimeBlock: string,
 ) => {
   const personaId = getPersonaDocumentId(systemType);
   const memoryId = getPersonaMemoryDocumentId(systemType);
@@ -471,6 +733,8 @@ ${documents['registry.skills'].content}
 ## MCP Registry
 ${documents['registry.mcp'].content}
 
+${runtimeBlock}
+
 ## Legacy Cortex Items
 ${legacyMemoryStr}
 `;
@@ -496,6 +760,7 @@ const planPersonaTools = async (
   systemType: MagiSystem,
   harnessBlock: string,
   userQuery: string,
+  runtime: RuntimeCapabilities,
 ): Promise<PlannedToolRequest[]> => {
   const config = systemConfigs[systemType];
 
@@ -510,6 +775,17 @@ Available tool request shapes:
 - mcp.call: { "server": "configured MCP server id", "tool": "server tool name", "arguments": {} }
 
 Request only tools that are directly useful and permissioned by the registry. Prefer at most two requests.
+
+Important:
+- The Authoritative Runtime Tool Manifest is live. Trust it over stale memory.
+- If the user asks about local code, files, repo structure, or whether MAGI can access the project, use filesystem MCP when it is listed.
+- Do not answer "browser sandbox cannot access filesystem" when bridge is online and filesystem MCP tools are listed. Request mcp.call instead.
+- If the user asks for skill details and a matching runtime skill is listed, request skill.run with mode "load".
+
+Concrete examples when filesystem MCP is available:
+- repository tree: { "toolId": "mcp.call", "arguments": { "server": "filesystem", "tool": "directory_tree", "arguments": { "path": ".", "excludePatterns": ["node_modules", "dist", ".git", ".magi/state"] } }, "reason": "Inspect project tree" }
+- read file: { "toolId": "mcp.call", "arguments": { "server": "filesystem", "tool": "read_text_file", "arguments": { "path": "App.tsx", "head": 160 } }, "reason": "Inspect source file" }
+- skill details: { "toolId": "skill.run", "arguments": { "skill": "browser-verification", "task": "Load SKILL.md", "mode": "load" }, "reason": "Inspect skill instructions" }
 
 Return JSON only:
 {
@@ -535,11 +811,11 @@ User query: "${userQuery}"
     }) as any);
 
     const text = response.choices[0]?.message?.content;
-    if (!text) return [];
+    if (!text) return suggestRuntimeToolRequests(systemType, userQuery, runtime);
     const parsed = safeParse(text, `${config.name} TOOL PLANNER`) as { requests?: unknown };
-    if (!Array.isArray(parsed.requests)) return [];
+    if (!Array.isArray(parsed.requests)) return suggestRuntimeToolRequests(systemType, userQuery, runtime);
 
-    return parsed.requests
+    const planned = parsed.requests
       .filter((request): request is PlannedToolRequest => {
         if (!request || typeof request !== 'object') return false;
         const candidate = request as PlannedToolRequest;
@@ -555,9 +831,15 @@ User query: "${userQuery}"
           : {},
         reason: typeof request.reason === 'string' ? request.reason : '',
       }));
+    if (planned.length === 0) {
+      return suggestRuntimeToolRequests(systemType, userQuery, runtime);
+    }
+    const augmented = [...planned];
+    suggestRuntimeToolRequests(systemType, userQuery, runtime).forEach(request => appendUniqueToolRequest(augmented, request));
+    return augmented.slice(0, 2);
   } catch (error) {
     console.warn(`[${config.name}] Tool-planning step failed.`, error);
-    return [];
+    return suggestRuntimeToolRequests(systemType, userQuery, runtime);
   }
 };
 
@@ -568,12 +850,14 @@ const queryArchetype = async (
   legacyMemoryStr: string,
   language: Language,
   harness: MagiHarnessContext,
+  runtime: RuntimeCapabilities,
+  runtimeBlock: string,
   onEvent?: QueryMagiOptions['onEvent'],
 ): Promise<PersonaQueryResult> => {
   const config = systemConfigs[systemType];
   const client = createClient(harness.settings);
   const modelName = getModelName(harness.settings);
-  const harnessBlock = buildPersonaHarness(systemType, harness.documents, legacyMemoryStr);
+  const harnessBlock = buildPersonaHarness(systemType, harness.documents, legacyMemoryStr, runtimeBlock);
   const allowedDocumentIds = new Set<HarnessDocumentId>([
     getPersonaMemoryDocumentId(systemType),
     'memory.shared',
@@ -586,7 +870,7 @@ const queryArchetype = async (
   const pendingActions: PendingAction[] = [];
   const streamEvents: StreamEvent[] = [];
   emitStreamEvent(streamEvents, onEvent, 'tool-plan', config.name, 'running', 'Planning permitted tool usage.');
-  const toolRequests = await planPersonaTools(client, modelName, harness.settings, systemType, harnessBlock, userQuery);
+  const toolRequests = await planPersonaTools(client, modelName, harness.settings, systemType, harnessBlock, userQuery, runtime);
   emitStreamEvent(
     streamEvents,
     onEvent,
@@ -821,6 +1105,7 @@ const queryCouncilExchange = async (
   contextStr: string,
   initialOutputs: Record<MagiSystem, MagiAnalysis>,
   pendingActions: PendingAction[],
+  runtimeBlock: string,
   onEvent?: QueryMagiOptions['onEvent'],
 ): Promise<{ exchange: CouncilExchange; clarifications: ClarificationRequest[]; events: StreamEvent[] }> => {
   const config = systemConfigs[systemType];
@@ -850,6 +1135,8 @@ ${harness.documents['council.protocol'].content}
 
 ## Shared Memory
 ${harness.documents['memory.shared'].content}
+
+${runtimeBlock}
 
 ## Conversation Context
 ${contextStr || 'NO PRIOR CONVERSATION.'}
@@ -991,12 +1278,27 @@ export const queryMagiSystem = async (
 
   const contextStr = formatHistory(history);
   const legacyMemoryStr = formatLegacyMemories(memories);
+  const expandRuntimeManifest = shouldExpandRuntimeManifest(prompt);
+  const runtime = await loadRuntimeCapabilities(event => {
+    streamEvents.push(event);
+    options.onEvent?.(event);
+  }, expandRuntimeManifest);
+  const runtimeBlock = formatRuntimeCapabilities(runtime, expandRuntimeManifest);
+  trace.push(makeTraceStep(
+    'runtime',
+    'BRIDGE',
+    runtime.bridge?.ok ? 'complete' : 'failed',
+    runtime.bridge?.ok
+      ? `Bridge online: ${runtime.bridge.skills.length} skill(s), ${runtime.bridge.mcpServers.length} MCP server(s).`
+      : `Bridge unavailable: ${runtime.errors.join('; ') || 'unknown error'}`,
+    runtimeBlock,
+  ));
 
   const runNode = async (systemType: MagiSystem) => {
     try {
       emit('persona', systemConfigs[systemType].name, 'queued', 'Queued for independent analysis.');
       return await withTimeout(
-        queryArchetype(systemType, prompt, contextStr, legacyMemoryStr, language, harness, event => {
+        queryArchetype(systemType, prompt, contextStr, legacyMemoryStr, language, harness, runtime, runtimeBlock, event => {
           streamEvents.push(event);
           options.onEvent?.(event);
         }),
@@ -1072,15 +1374,15 @@ export const queryMagiSystem = async (
 
   emit('meeting', 'COUNCIL', 'running', 'Starting three-persona council round.');
   const meetingResults = await Promise.all([
-    queryCouncilExchange(MagiSystem.MELCHIOR, prompt, language, harness, contextStr, initialOutputs, pendingActions, event => {
+    queryCouncilExchange(MagiSystem.MELCHIOR, prompt, language, harness, contextStr, initialOutputs, pendingActions, runtimeBlock, event => {
       streamEvents.push(event);
       options.onEvent?.(event);
     }),
-    queryCouncilExchange(MagiSystem.BALTHASAR, prompt, language, harness, contextStr, initialOutputs, pendingActions, event => {
+    queryCouncilExchange(MagiSystem.BALTHASAR, prompt, language, harness, contextStr, initialOutputs, pendingActions, runtimeBlock, event => {
       streamEvents.push(event);
       options.onEvent?.(event);
     }),
-    queryCouncilExchange(MagiSystem.CASPER, prompt, language, harness, contextStr, initialOutputs, pendingActions, event => {
+    queryCouncilExchange(MagiSystem.CASPER, prompt, language, harness, contextStr, initialOutputs, pendingActions, runtimeBlock, event => {
       streamEvents.push(event);
       options.onEvent?.(event);
     }),
@@ -1124,6 +1426,8 @@ ${harness.documents['registry.skills'].content}
 
 ## MCP Registry
 ${harness.documents['registry.mcp'].content}
+
+${runtimeBlock}
 
 ## Conversation Context
 ${contextStr || 'NO PRIOR CONVERSATION.'}
@@ -1177,6 +1481,7 @@ Return JSON only:
 
 If the pending action queue is not empty, do not claim those actions have executed. Ask for approval in clarificationRequests when approval is required.
 If the next safe step depends on missing user intent, set requiresUserInput true and ask focused questions.
+If runtime bridge is online and filesystem MCP tools are listed, do not say the system cannot inspect local files. Instead summarize tool results or state which mcp.call should be approved/executed next.
 `;
 
   emit('synthesis', 'COUNCIL', 'running', 'Integrating votes, meeting transcript, and action queue.');
