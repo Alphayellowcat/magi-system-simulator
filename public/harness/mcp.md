@@ -17,12 +17,12 @@ The bridge currently supports:
 - `stdio`: starts a local MCP server command and communicates over newline-delimited JSON-RPC.
 - `streamableHttp`: sends JSON-RPC requests to a configured MCP HTTP endpoint and accepts JSON or SSE responses.
 
-## Planned Servers
+## Common Servers
 
 ```mcp
-filesystem: configurable
+filesystem: configurable; local file read/write tools
+browser: configurable; browser_navigate, browser_read_page, browser_screenshot, browser_click, browser_type, browser_close
 github: configurable
-browser: configurable
 openai-docs: configurable
 ```
 

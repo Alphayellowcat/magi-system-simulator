@@ -10,7 +10,7 @@ Use this skill when the task requires checking the running UI rather than only r
 ## Workflow
 
 1. Confirm the dev server URL and bridge status.
-2. Open or reload the local page.
+2. Use Browser MCP when it is listed in the Runtime Tool Manifest; request `browser_navigate`, then `browser_read_page`, and capture `browser_screenshot` when visual evidence is needed.
 3. Capture the cheapest useful signal first: DOM snapshot, visible text, console errors, or screenshot.
 4. Verify the specific workflow under test:
    - Ops settings save/test connection.
@@ -23,5 +23,5 @@ Use this skill when the task requires checking the running UI rather than only r
 ## Guardrails
 
 - Do not transmit secrets or submit external forms during verification.
-- For local-only UI checks, prefer read-only inspection first.
+- For local-only UI checks, prefer read-only Browser MCP inspection first.
 - When browser automation is unavailable, report that separately from application health.

@@ -30,7 +30,8 @@ This document declares the tool surface and per-persona permissions. Browser-saf
 
 ## Approval Gate
 
-- Read-only actions such as `web.search.tavily`, `skill.run` with `mode=load`, and MCP tools named like `read_*`, `list_*`, `get_*`, `search_*`, `find_*`, `stat_*`, or `inspect_*` may run automatically when permissioned.
+- Read-only actions such as `web.search.tavily`, `skill.run` with `mode=load`, MCP tools named like `read_*`, `list_*`, `get_*`, `search_*`, `find_*`, `stat_*`, or `inspect_*`, and Browser MCP tools `browser_navigate`, `browser_read_page`, `browser_screenshot`, `browser_close` may run automatically when permissioned.
+- Browser MCP tools `browser_click` and `browser_type` must be queued for user approval.
 - Mutating or ambiguous local actions must be queued as `pendingActions` and require user approval before execution.
 - Approval decisions and execution results must be added to the session trace.
 

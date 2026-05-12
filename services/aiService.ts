@@ -17,15 +17,18 @@ import {
   PendingActionRisk,
   SessionTraceStep,
   StreamEvent,
+  TextDeltaEvent,
   ToolId,
   ToolTrace,
+  AuditEvent,
+  AuditRef,
 } from '../types';
 import {
   getPersonaDocumentId,
   getPersonaMemoryDocumentId,
   hasToolPermission,
 } from './harnessService';
-import { BridgeSkill, BridgeStatus, executeBridgeTool, getBridgeStatus, listMcpTools } from './bridgeService';
+import { appendAuditEvents, BridgeSkill, BridgeStatus, executeBridgeTool, getBridgeStatus, listMcpTools } from './bridgeService';
 
 interface MagiHarnessContext {
   settings: HarnessSettings;
@@ -51,6 +54,9 @@ interface PlannedToolRequest {
 
 interface QueryMagiOptions {
   onEvent?: (event: StreamEvent) => void;
+  onTextDelta?: (event: TextDeltaEvent) => void;
+  sessionId?: string;
+  runId?: string;
 }
 
 interface PersonaQueryResult extends MagiAnalysis {
@@ -178,6 +184,7 @@ const createChatParams = (
     temperature?: number;
     max_tokens?: number;
     response_format?: { type: 'json_object' };
+    stream?: boolean;
   },
 ) => {
   const params: Record<string, unknown> = { ...body };
@@ -303,6 +310,116 @@ const emitStreamEvent = (
   return event;
 };
 
+const emitTextDelta = (
+  onTextDelta: QueryMagiOptions['onTextDelta'] | undefined,
+  delta: string,
+  fullText: string,
+) => {
+  const event: TextDeltaEvent = {
+    id: makeId('delta'),
+    role: 'synthesis',
+    delta,
+    fullText,
+    timestamp: Date.now(),
+  };
+  onTextDelta?.(event);
+  return event;
+};
+
+const makeAuditEvent = (
+  sessionId: string,
+  runId: string,
+  phase: string,
+  actor: string,
+  status: string,
+  summary: string,
+  kind: AuditEvent['kind'],
+  details?: unknown,
+  timestamp = Date.now(),
+): AuditEvent => ({
+  id: makeId('audit'),
+  sessionId,
+  runId,
+  timestamp,
+  phase,
+  actor,
+  status,
+  summary,
+  details,
+  kind,
+});
+
+const buildAuditEvents = (
+  sessionId: string,
+  runId: string,
+  streamEvents: StreamEvent[],
+  trace: SessionTraceStep[],
+  toolTraces: ToolTrace[],
+  pendingActions: PendingAction[],
+  finalSynthesis: string,
+): AuditEvent[] => [
+  ...streamEvents.map(event => makeAuditEvent(
+    sessionId,
+    runId,
+    event.phase,
+    event.actor,
+    event.status,
+    event.message,
+    'stream',
+    { details: event.details, metadata: event.metadata },
+    event.timestamp,
+  )),
+  ...trace.map(step => makeAuditEvent(
+    sessionId,
+    runId,
+    step.phase,
+    step.actor,
+    step.status,
+    step.summary,
+    'trace',
+    step.details,
+    step.timestamp,
+  )),
+  ...toolTraces.map(traceItem => makeAuditEvent(
+    sessionId,
+    runId,
+    'tool',
+    traceItem.systemName,
+    traceItem.status,
+    `${traceItem.toolId}: ${traceItem.summary || traceItem.query || traceItem.status}`,
+    'tool',
+    traceItem.details,
+  )),
+  ...pendingActions.map(action => makeAuditEvent(
+    sessionId,
+    runId,
+    'approval',
+    action.actor,
+    action.status,
+    `${action.toolId}: ${action.reason}`,
+    'approval',
+    {
+      actionId: action.id,
+      risk: action.risk,
+      requiresApproval: action.requiresApproval,
+      arguments: action.arguments,
+      result: action.result,
+      error: action.error,
+    },
+    action.createdAt,
+  )),
+  makeAuditEvent(
+    sessionId,
+    runId,
+    'synthesis',
+    'COUNCIL',
+    'complete',
+    'Final synthesis text recorded.',
+    'synthesis',
+    finalSynthesis,
+  ),
+];
+
 const normalizeClarificationRequests = (
   rawRequests: unknown,
   fallbackReason?: string,
@@ -335,8 +452,8 @@ const normalizeClarificationRequests = (
     .slice(0, 5);
 };
 
-const readOnlyMcpToolPattern = /^(read|list|get|search|find|stat|describe|inspect|directory_tree|list_allowed)/i;
-const mutatingMcpToolPattern = /(^|_)(write|edit|delete|remove|move|rename|create|mkdir|touch|patch|update|replace|append|run|execute|shell|command)($|_)/i;
+const readOnlyMcpToolPattern = /^(read|list|get|search|find|stat|describe|inspect|directory_tree|list_allowed|browser_navigate|browser_read_page|browser_screenshot|browser_close)/i;
+const mutatingMcpToolPattern = /(^|_)(write|edit|delete|remove|move|rename|create|mkdir|touch|patch|update|replace|append|run|execute|shell|command|click|type|fill|submit)($|_)/i;
 
 const assessToolRequestRisk = (request: PlannedToolRequest): ToolRiskAssessment => {
   const args = request.arguments || {};
@@ -525,11 +642,17 @@ const formatRuntimeCapabilities = (runtime: RuntimeCapabilities, expanded: boole
     : 'NO SKILLS DISCOVERED BY BRIDGE.';
 
   const hasFilesystem = runtime.mcpServers.some(server => server.server === 'filesystem');
+  const hasBrowser = runtime.mcpServers.some(server => server.server === 'browser');
   const toolUseRules = hasFilesystem
     ? `- To inspect this repository or local code, request mcp.call against the filesystem server instead of asking the user to configure filesystem again.
 - Useful filesystem calls: list_allowed_directories {}, list_directory {"path":"."}, directory_tree {"path":".","excludePatterns":["node_modules","dist",".git",".magi/state"]}, search_files {"path":".","pattern":"**/*.ts"}, read_text_file {"path":"App.tsx","head":200}.
 - Mutating filesystem tools such as write_file, edit_file, move_file, create_directory require user approval.`
     : '- No filesystem MCP server is currently listed by the bridge. Do not claim local file access unless a filesystem server appears in the manifest.';
+  const browserRules = hasBrowser
+    ? `- To inspect or verify web pages, request mcp.call against the browser server.
+- Useful browser calls: browser_navigate {"url":"http://localhost:4123/"}, browser_read_page {"maxChars":12000}, browser_screenshot {"name":"magi-ui","fullPage":true}.
+- Browser click/type actions must be queued for human approval.`
+    : '- No browser MCP server is currently listed by the bridge. Browser skills may explain workflow, but they do not grant browser execution.';
 
   const mcpServers = runtime.mcpServers.length
     ? runtime.mcpServers.map(server => {
@@ -560,6 +683,7 @@ ${mcpServers}
 ## Tool-Use Rules From Runtime
 
 ${toolUseRules}
+${browserRules}
 - To inspect a skill's instructions, request skill.run {"skill":"<runtime skill id>","mode":"load","task":"why the skill is needed"}.
 `;
 };
@@ -597,6 +721,10 @@ const suggestRuntimeToolRequests = (
   const asksAboutFiles = /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|readme|repo|repository|source|file|directory|codebase|filesystem|mcp/.test(query);
   const asksAboutSkills = /skill|技能|能力包|加载|详情|instructions|skill\.md/.test(query);
   const asksAboutBrowsing = /浏览|网页|搜索|联网|browser|web|search/.test(query);
+  const urlMatch = userQuery.match(/https?:\/\/[^\s"'<>]+|localhost:\d+[^\s"'<>]*|127\.0\.0\.1:\d+[^\s"'<>]*/i);
+  const browserUrl = urlMatch
+    ? (urlMatch[0].startsWith('http') ? urlMatch[0] : `http://${urlMatch[0]}`)
+    : '';
 
   if (asksAboutFiles && runtimeHasMcpTool(runtime, 'filesystem', 'directory_tree')) {
     if (systemType === MagiSystem.MELCHIOR) {
@@ -647,6 +775,35 @@ const suggestRuntimeToolRequests = (
   }
 
   if (asksAboutBrowsing && runtime?.bridge?.skills?.length) {
+    if (systemType === MagiSystem.CASPER && runtimeHasMcpTool(runtime, 'browser', 'browser_navigate') && browserUrl) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'mcp.call',
+        arguments: {
+          server: 'browser',
+          tool: 'browser_navigate',
+          arguments: {
+            url: browserUrl,
+            waitUntil: 'domcontentloaded',
+          },
+        },
+        reason: `The user asked for browser verification; navigate to ${browserUrl}.`,
+      });
+    }
+
+    if (systemType === MagiSystem.CASPER && runtimeHasMcpTool(runtime, 'browser', 'browser_read_page')) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'mcp.call',
+        arguments: {
+          server: 'browser',
+          tool: 'browser_read_page',
+          arguments: {
+            maxChars: 12000,
+          },
+        },
+        reason: 'Read the current browser page through Browser MCP before making claims about the UI.',
+      });
+    }
+
     const browserSkill = runtime.bridge.skills.find(skill => skill.id === 'browser') ||
       runtime.bridge.skills.find(skill => skill.id === 'browser-verification');
     if (browserSkill && runtimeHasSkill(runtime, browserSkill.id)) {
@@ -786,6 +943,12 @@ Concrete examples when filesystem MCP is available:
 - repository tree: { "toolId": "mcp.call", "arguments": { "server": "filesystem", "tool": "directory_tree", "arguments": { "path": ".", "excludePatterns": ["node_modules", "dist", ".git", ".magi/state"] } }, "reason": "Inspect project tree" }
 - read file: { "toolId": "mcp.call", "arguments": { "server": "filesystem", "tool": "read_text_file", "arguments": { "path": "App.tsx", "head": 160 } }, "reason": "Inspect source file" }
 - skill details: { "toolId": "skill.run", "arguments": { "skill": "browser-verification", "task": "Load SKILL.md", "mode": "load" }, "reason": "Inspect skill instructions" }
+
+Concrete examples when browser MCP is available:
+- navigate: { "toolId": "mcp.call", "arguments": { "server": "browser", "tool": "browser_navigate", "arguments": { "url": "http://localhost:4123/", "waitUntil": "domcontentloaded" } }, "reason": "Open page for browser verification" }
+- read page: { "toolId": "mcp.call", "arguments": { "server": "browser", "tool": "browser_read_page", "arguments": { "maxChars": 12000 } }, "reason": "Read current page" }
+- screenshot: { "toolId": "mcp.call", "arguments": { "server": "browser", "tool": "browser_screenshot", "arguments": { "name": "magi-ui", "fullPage": true } }, "reason": "Capture visual artifact" }
+- click/type are high-risk browser actions and should be requested only when the user asked for that interaction.
 
 Return JSON only:
 {
@@ -1224,6 +1387,97 @@ Return JSON only:
   }
 };
 
+const streamFinalSynthesis = async (
+  client: OpenAI,
+  modelName: string,
+  harness: MagiHarnessContext,
+  language: Language,
+  prompt: string,
+  synthesisResult: {
+    centralAnalysis?: string;
+    synthesis?: string;
+    executionPlan?: string;
+    finalDecision?: boolean;
+    requiresUserInput?: boolean;
+  },
+  meeting: CouncilExchange[],
+  pendingActions: PendingAction[],
+  fallback: string,
+  emit: (
+    phase: string,
+    actor: string,
+    eventStatus: StreamEvent['status'],
+    message: string,
+    details?: string,
+  ) => StreamEvent,
+  onTextDelta?: QueryMagiOptions['onTextDelta'],
+) => {
+  let fullText = '';
+  const langInstruction = language === 'CN'
+    ? 'Output in Simplified Chinese.'
+    : 'Output in English.';
+
+  const promptText = `
+You are the final MAGI council voice. Write the final user-facing answer only; do not return JSON.
+
+${langInstruction}
+
+## User Query
+${prompt}
+
+## Structured Council Result
+Central analysis: ${synthesisResult.centralAnalysis || ''}
+Decision: ${synthesisResult.finalDecision === undefined ? 'unset' : synthesisResult.finalDecision ? 'approve' : 'reject'}
+Requires user input: ${Boolean(synthesisResult.requiresUserInput)}
+Draft synthesis: ${synthesisResult.synthesis || ''}
+Execution plan: ${synthesisResult.executionPlan || ''}
+
+## Council Meeting
+${formatMeetingTranscript(meeting)}
+
+## Pending Actions
+${formatPendingActions(pendingActions)}
+
+Rules:
+- Be concise and concrete.
+- If pending actions require approval, clearly say they are waiting and do not claim they have executed.
+- If user input is required, ask the focused question(s) implied by the draft.
+- Preserve the substance of the structured council result.
+`;
+
+  emit('synthesis-stream', 'COUNCIL', 'running', 'Streaming final synthesis text.');
+
+  try {
+    const stream = await client.chat.completions.create(createChatParams(harness.settings, {
+      model: modelName,
+      messages: [{ role: 'system', content: promptText }],
+      temperature: 0.5,
+      max_tokens: 2048,
+      stream: true,
+    }) as any);
+
+    for await (const chunk of stream as any) {
+      const delta = chunk.choices?.[0]?.delta?.content || '';
+      if (!delta) continue;
+      fullText += delta;
+      emitTextDelta(onTextDelta, delta, fullText);
+    }
+
+    const finalText = fullText.trim();
+    emit('synthesis-stream', 'COUNCIL', 'complete', finalText ? 'Final synthesis stream completed.' : 'Final synthesis stream returned no text.');
+    return finalText || fallback;
+  } catch (error) {
+    emit(
+      'synthesis-stream',
+      'COUNCIL',
+      'failed',
+      'Final synthesis stream failed; falling back to structured synthesis.',
+      error instanceof Error ? error.message : 'Unknown streaming error',
+    );
+    return fallback;
+  }
+};
+
 export const queryMagiSystem = async (
   prompt: string,
   history: Message[],
@@ -1233,6 +1487,7 @@ export const queryMagiSystem = async (
   options: QueryMagiOptions = {},
 ): Promise<MagiResponse> => {
   const streamEvents: StreamEvent[] = [];
+  const runId = options.runId || makeId('run');
   const emit = (
     phase: string,
     actor: string,
@@ -1531,6 +1786,21 @@ If runtime bridge is online and filesystem MCP tools are listed, do not say the 
     pendingActions.some(action => action.requiresApproval && action.status === 'pending') ||
     clarificationRequests.some(request => request.required !== false);
 
+  const fallbackSynthesis = synthesisResult.synthesis || 'NO SYNTHESIS RETURNED.';
+  const finalSynthesis = await streamFinalSynthesis(
+    client,
+    modelName,
+    harness,
+    language,
+    prompt,
+    { ...synthesisResult, requiresUserInput },
+    meeting,
+    pendingActions,
+    fallbackSynthesis,
+    emit,
+    options.onTextDelta,
+  );
+
   trace.push(makeTraceStep(
     'synthesis',
     'COUNCIL',
@@ -1572,12 +1842,49 @@ If runtime bridge is online and filesystem MCP tools are listed, do not say the 
     ));
   }
 
+  let auditRef: AuditRef | undefined;
+  if (options.sessionId) {
+    try {
+      const auditEvents = buildAuditEvents(
+        options.sessionId,
+        runId,
+        streamEvents,
+        trace,
+        allToolTraces,
+        pendingActions,
+        finalSynthesis,
+      );
+      const audit = await appendAuditEvents(options.sessionId, auditEvents);
+      auditRef = {
+        sessionId: options.sessionId,
+        runId,
+        filePath: audit.filePath,
+        eventCount: audit.count,
+      };
+      trace.push(makeTraceStep(
+        'audit',
+        'HARNESS',
+        'complete',
+        `Audit log appended (${audit.count} events).`,
+        audit.filePath,
+      ));
+    } catch (error) {
+      trace.push(makeTraceStep(
+        'audit',
+        'HARNESS',
+        'failed',
+        'Audit log append failed.',
+        error instanceof Error ? error.message : 'Unknown audit error',
+      ));
+    }
+  }
+
   return {
     centralAnalysis: synthesisResult.centralAnalysis || 'Integrated council analysis.',
     melchior,
     balthasar,
     casper,
-    synthesis: synthesisResult.synthesis || 'NO SYNTHESIS RETURNED.',
+    synthesis: finalSynthesis,
     executionPlan: synthesisResult.executionPlan || '',
     finalDecision: synthesisResult.finalDecision !== undefined ? synthesisResult.finalDecision : fallbackDecision,
     groundingSources: allSources,
@@ -1589,6 +1896,7 @@ If runtime bridge is online and filesystem MCP tools are listed, do not say the 
     pendingActions,
     clarificationRequests,
     streamEvents,
+    auditRef,
     requiresUserInput,
   };
 };

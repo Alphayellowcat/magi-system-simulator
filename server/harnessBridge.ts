@@ -47,6 +47,7 @@ const MCP_CONFIG_FILES = ['.magi/mcp/servers.json', '.magi/mcp.json', 'magi.mcp.
 const MCP_PROTOCOL_VERSION = '2025-06-18';
 const STATE_KEYS = new Set(['sessions', 'memories', 'settings', 'documents']);
 const isWindows = process.platform === 'win32';
+const sensitiveKeyPattern = /api[-_]?key|token|secret|password|authorization|cookie/i;
 
 const normalizeId = (value: string) => value.trim().toLowerCase().replace(/[^a-z0-9_.:-]+/g, '-');
 
@@ -80,12 +81,33 @@ const readJsonFile = async <T,>(filePath: string | null, fallback: T): Promise<T
 };
 
 const getStateDir = (root: string) => path.join(root, '.magi', 'state');
+const getAuditDir = (root: string) => path.join(root, '.magi', 'audit');
+const getArtifactDir = (root: string) => path.join(root, '.magi', 'artifacts');
 
 const getStatePath = (root: string, key: string) => {
   if (!STATE_KEYS.has(key)) {
     throw new Error(`Unsupported state key: ${key}`);
   }
   return path.join(getStateDir(root), `${key}.json`);
+};
+
+const normalizeFileStem = (value: string) => {
+  const normalized = normalizeId(value).replace(/[:.]+/g, '-');
+  if (!normalized) throw new Error('Invalid file id');
+  return normalized;
+};
+
+const getAuditPath = (root: string, sessionId: string) =>
+  path.join(getAuditDir(root), `${normalizeFileStem(sessionId)}.jsonl`);
+
+const redactSensitive = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(redactSensitive);
+  if (!isRecord(value)) return value;
+
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    sensitiveKeyPattern.test(key) ? '[REDACTED]' : redactSensitive(item),
+  ]));
 };
 
 const readState = async (root: string, key: string) => {
@@ -117,6 +139,50 @@ const writeState = async (root: string, key: string, value: unknown) => {
   await fs.writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
   await fs.rename(tmpPath, filePath);
   return filePath;
+};
+
+const appendAuditEvents = async (root: string, sessionId: string, events: unknown[]) => {
+  const auditDir = getAuditDir(root);
+  const filePath = getAuditPath(root, sessionId);
+  await fs.mkdir(auditDir, { recursive: true });
+
+  const lines = events
+    .filter(isRecord)
+    .map(event => JSON.stringify(redactSensitive(event)));
+
+  if (lines.length > 0) {
+    await fs.appendFile(filePath, `${lines.join('\n')}\n`, 'utf8');
+  }
+
+  return {
+    filePath,
+    count: lines.length,
+  };
+};
+
+const readAuditEvents = async (root: string, sessionId: string, limit: number) => {
+  const filePath = getAuditPath(root, sessionId);
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    const events = raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .slice(-limit)
+      .map(line => JSON.parse(line));
+
+    return {
+      filePath,
+      events,
+    };
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') {
+      return {
+        filePath,
+        events: [],
+      };
+    }
+    throw error;
+  }
 };
 
 const getStorageStatus = async (root: string) => {
@@ -584,6 +650,7 @@ const callMcp = async (
   mcpConfig: McpConfig,
   args: Record<string, unknown>,
   action: 'listTools' | 'callTool',
+  stdioClients?: Map<string, StdioMcpClient>,
 ) => {
   const serverName = typeof args.server === 'string' ? args.server : '';
   if (!serverName) throw new Error('mcp.call requires arguments.server');
@@ -609,13 +676,19 @@ const callMcp = async (
     };
   }
 
-  const client = new StdioMcpClient({
-    ...server,
-    cwd: server.cwd ? path.resolve(root, server.cwd) : root,
-  });
+  const clientKey = `${serverName}:${JSON.stringify(server)}`;
+  let client = stdioClients?.get(clientKey);
 
   try {
-    await client.initialize();
+    if (!client) {
+      client = new StdioMcpClient({
+        ...server,
+        cwd: server.cwd ? path.resolve(root, server.cwd) : root,
+      });
+      await client.initialize();
+      stdioClients?.set(clientKey, client);
+    }
+
     const result = action === 'listTools'
       ? await client.listTools()
       : await client.callTool(toolName, toolArguments);
@@ -626,8 +699,14 @@ const callMcp = async (
       action,
       result,
     };
+  } catch (error) {
+    if (client && stdioClients?.has(clientKey)) {
+      client.close();
+      stdioClients.delete(clientKey);
+    }
+    throw error;
   } finally {
-    client.close();
+    if (!stdioClients) client?.close();
   }
 };
 
@@ -636,13 +715,14 @@ const executeTool = async (
   bridgeConfig: BridgeConfig,
   mcpConfig: McpConfig,
   input: ToolExecutionInput,
+  stdioClients?: Map<string, StdioMcpClient>,
 ) => {
   if (input.toolId === 'skill.run') {
     return runSkill(root, bridgeConfig, input.arguments || {});
   }
 
   if (input.toolId === 'mcp.call') {
-    return callMcp(root, mcpConfig, input.arguments || {}, 'callTool');
+    return callMcp(root, mcpConfig, input.arguments || {}, 'callTool', stdioClients);
   }
 
   throw new Error(`Unsupported bridge tool: ${input.toolId}`);
@@ -651,6 +731,12 @@ const executeTool = async (
 export const harnessBridgePlugin = (root: string): Plugin => ({
   name: 'magi-harness-bridge',
   configureServer(server) {
+    const stdioClients = new Map<string, StdioMcpClient>();
+    server.httpServer?.on('close', () => {
+      stdioClients.forEach(client => client.close());
+      stdioClients.clear();
+    });
+
     server.middlewares.use(async (req, res, next) => {
       if (!req.url?.startsWith('/api/harness/bridge')) {
         next();
@@ -667,12 +753,16 @@ export const harnessBridgePlugin = (root: string): Plugin => ({
         if (req.method === 'GET' && requestUrl.pathname === '/api/harness/bridge/status') {
           const skills = await scanSkills(root, bridgeConfig);
           const storage = await getStorageStatus(root);
+          const auditDir = getAuditDir(root);
+          const artifactDir = getArtifactDir(root);
           sendJson(res, 200, {
             ok: true,
             cwd: root,
             bridgeConfigPath,
             mcpConfigPath,
             storage,
+            auditDir,
+            artifactDir,
             allowSkillScripts: Boolean(bridgeConfig.allowSkillScripts),
             skills: skills.map(skill => ({
               id: skill.id,
@@ -681,6 +771,28 @@ export const harnessBridgePlugin = (root: string): Plugin => ({
               dir: skill.dir,
             })),
             mcpServers: Object.keys(mcpConfig.servers || {}),
+          });
+          return;
+        }
+
+        const auditMatch = requestUrl.pathname.match(/^\/api\/harness\/bridge\/audit\/([^/]+)$/);
+        if (auditMatch && req.method === 'GET') {
+          const limit = Math.max(1, Math.min(1000, Number(requestUrl.searchParams.get('limit') || 200)));
+          const audit = await readAuditEvents(root, decodeURIComponent(auditMatch[1]), limit);
+          sendJson(res, 200, {
+            ok: true,
+            ...audit,
+          });
+          return;
+        }
+
+        if (auditMatch && req.method === 'POST') {
+          const body = await readRequestBody(req);
+          const events = isRecord(body) && Array.isArray(body.events) ? body.events : [];
+          const audit = await appendAuditEvents(root, decodeURIComponent(auditMatch[1]), events);
+          sendJson(res, 200, {
+            ok: true,
+            ...audit,
           });
           return;
         }
@@ -716,7 +828,7 @@ export const harnessBridgePlugin = (root: string): Plugin => ({
         if (req.method === 'POST' && requestUrl.pathname === '/api/harness/bridge/tools/execute') {
           const body = await readRequestBody(req) as ToolExecutionInput;
           const startedAt = Date.now();
-          const result = await executeTool(root, bridgeConfig, mcpConfig, body);
+          const result = await executeTool(root, bridgeConfig, mcpConfig, body, stdioClients);
           sendJson(res, 200, {
             ok: true,
             actor: body.actor || 'HARNESS',
@@ -729,7 +841,7 @@ export const harnessBridgePlugin = (root: string): Plugin => ({
 
         if (req.method === 'POST' && requestUrl.pathname === '/api/harness/bridge/mcp/list-tools') {
           const body = await readRequestBody(req);
-          const result = await callMcp(root, mcpConfig, isRecord(body) ? body : {}, 'listTools');
+          const result = await callMcp(root, mcpConfig, isRecord(body) ? body : {}, 'listTools', stdioClients);
           sendJson(res, 200, { ok: true, result });
           return;
         }

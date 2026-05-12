@@ -10,6 +10,18 @@
       ],
       "cwd": ".",
       "timeoutMs": 30000
+    },
+    "browser": {
+      "transport": "stdio",
+      "command": "node",
+      "args": [
+        "server/mcp/browserMcpServer.mjs"
+      ],
+      "cwd": ".",
+      "env": {
+        "MAGI_BROWSER_ARTIFACT_DIR": ".magi/artifacts/browser"
+      },
+      "timeoutMs": 30000
     }
   }
 }

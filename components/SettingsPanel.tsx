@@ -7,7 +7,7 @@ import {
 } from '../types';
 import { HARNESS_DOCUMENT_DEFINITIONS } from '../services/harnessService';
 import { testModelConnection } from '../services/aiService';
-import { BridgeStatus, getBridgeStatus } from '../services/bridgeService';
+import { BridgeStatus, getBridgeStatus, listMcpTools } from '../services/bridgeService';
 
 interface SettingsPanelProps {
   settings: HarnessSettings;
@@ -32,6 +32,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [testMessage, setTestMessage] = useState('');
   const [bridgeStatus, setBridgeStatus] = useState<BridgeStatus | null>(null);
   const [bridgeMessage, setBridgeMessage] = useState('BRIDGE STATUS UNKNOWN');
+  const [browserToolCount, setBrowserToolCount] = useState<number | null>(null);
   const selectedDocument = documents[selectedDocumentId];
   const isDirty = JSON.stringify(draftSettings) !== JSON.stringify(settings);
 
@@ -45,8 +46,19 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
       const status = await getBridgeStatus();
       setBridgeStatus(status);
       setBridgeMessage(`ONLINE: ${status.skills.length} SKILLS, ${status.mcpServers.length} MCP SERVERS`);
+      setBrowserToolCount(null);
+      if (status.mcpServers.includes('browser')) {
+        try {
+          const result = await listMcpTools('browser') as any;
+          const tools = Array.isArray(result?.result?.tools) ? result.result.tools : [];
+          setBrowserToolCount(tools.length);
+        } catch {
+          setBrowserToolCount(0);
+        }
+      }
     } catch (error) {
       setBridgeStatus(null);
+      setBrowserToolCount(null);
       setBridgeMessage(error instanceof Error ? error.message : 'BRIDGE OFFLINE');
     }
   };
@@ -255,6 +267,19 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   ))}
                 </div>
               )}
+            </div>
+            <div className="col-span-2 border border-magi-dim/20 p-2">
+              <div className="text-magi-dim uppercase tracking-wider mb-1">Audit / Artifacts</div>
+              <div className="text-gray-300 break-all">{bridgeStatus.auditDir || 'audit unavailable'}</div>
+              <div className="mt-1 text-gray-300 break-all">{bridgeStatus.artifactDir || 'artifacts unavailable'}</div>
+            </div>
+            <div className="col-span-2 border border-magi-dim/20 p-2">
+              <div className="text-magi-dim uppercase tracking-wider mb-1">Browser MCP</div>
+              <div className={bridgeStatus.mcpServers.includes('browser') ? 'text-green-400' : 'text-magi-dim'}>
+                {bridgeStatus.mcpServers.includes('browser')
+                  ? `online${browserToolCount !== null ? `: ${browserToolCount} tools` : ''}`
+                  : 'not configured'}
+              </div>
             </div>
             <div className="col-span-2 border border-magi-dim/20 p-2">
               <div className="text-magi-dim uppercase tracking-wider mb-1">Skills</div>

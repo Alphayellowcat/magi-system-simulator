@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { queryMagiSystem } from './services/aiService';
 import MagiNode from './components/MagiNode';
 import SettingsPanel from './components/SettingsPanel';
-import { HarnessDocumentId, HarnessDocuments, HarnessSettings, MagiResponse, MagiSystem, ProcessingState, Session, Message, Language, MemoryItem, PendingAction, StreamEvent } from './types';
+import { AuditEvent, AuditRef, HarnessDocumentId, HarnessDocuments, HarnessSettings, MagiResponse, MagiSystem, ProcessingState, Session, Message, Language, MemoryItem, PendingAction, StreamEvent } from './types';
 import {
   applyDocumentOperations,
   clearSavedHarnessDocuments,
@@ -13,7 +13,7 @@ import {
   saveHarnessDocuments,
   saveHarnessSettings,
 } from './services/harnessService';
-import { executeBridgeTool } from './services/bridgeService';
+import { appendAuditEvents, executeBridgeTool } from './services/bridgeService';
 import { loadLocalState, loadPersistentState, savePersistentState } from './services/stateStorageService';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -33,6 +33,7 @@ const App: React.FC = () => {
   const [sidebarTab, setSidebarTab] = useState<'PROTOCOLS' | 'CORTEX' | 'OPS'>('PROTOCOLS');
   const [notification, setNotification] = useState<string | null>(null);
   const [liveStreamEvents, setLiveStreamEvents] = useState<StreamEvent[]>([]);
+  const [liveSynthesis, setLiveSynthesis] = useState('');
   
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -113,7 +114,7 @@ const App: React.FC = () => {
     if (status === 'THINKING' || status === 'COMPLETE') {
       scrollToBottom();
     }
-  }, [sessions, status]);
+  }, [sessions, status, liveSynthesis, liveStreamEvents.length]);
 
   // Scroll Button Logic
   useEffect(() => {
@@ -234,6 +235,47 @@ const App: React.FC = () => {
     details,
   });
 
+  const findMagiData = (messageId: string): MagiResponse | null => {
+    for (const session of sessions) {
+      for (const message of session.messages) {
+        if (message.id === messageId && message.magiData) return message.magiData;
+      }
+    }
+    return null;
+  };
+
+  const makeAuditEvent = (
+    auditRef: AuditRef,
+    event: StreamEvent,
+    kind: AuditEvent['kind'],
+    details?: unknown,
+  ): AuditEvent => ({
+    id: uuidv4(),
+    sessionId: auditRef.sessionId,
+    runId: auditRef.runId,
+    timestamp: event.timestamp,
+    phase: event.phase,
+    actor: event.actor,
+    status: event.status,
+    summary: event.message,
+    details: details ?? event.details,
+    kind,
+  });
+
+  const appendUiAudit = async (
+    auditRef: AuditRef | undefined,
+    event: StreamEvent,
+    kind: AuditEvent['kind'],
+    details?: unknown,
+  ) => {
+    if (!auditRef) return;
+    try {
+      await appendAuditEvents(auditRef.sessionId, [makeAuditEvent(auditRef, event, kind, details)]);
+    } catch (error) {
+      console.warn('UI audit append failed', error);
+    }
+  };
+
   const updateMagiMessage = (messageId: string, updater: (data: MagiResponse) => MagiResponse) => {
     setSessions(prev => prev.map(session => ({
       ...session,
@@ -319,6 +361,7 @@ const App: React.FC = () => {
 
   const handleApproveAction = async (messageId: string, actionId: string) => {
     const action = findPendingAction(messageId, actionId);
+    const messageData = findMagiData(messageId);
     if (!action || action.status !== 'pending') return;
 
     if (action.toolId !== 'skill.run' && action.toolId !== 'mcp.call') {
@@ -328,6 +371,7 @@ const App: React.FC = () => {
         status: 'failed',
         error: event.message,
       }), event);
+      appendUiAudit(messageData?.auditRef, event, 'approval', { actionId, toolId: action.toolId });
       setNotification('ACTION FAILED');
       return;
     }
@@ -337,6 +381,7 @@ const App: React.FC = () => {
       ...current,
       status: 'executing',
     }), startedEvent);
+    appendUiAudit(messageData?.auditRef, startedEvent, 'approval', { actionId, toolId: action.toolId, arguments: action.arguments });
 
     try {
       const result = await executeBridgeTool(action.toolId, action.arguments, action.actor);
@@ -347,6 +392,7 @@ const App: React.FC = () => {
         result: result.result,
         error: undefined,
       }), doneEvent);
+      appendUiAudit(messageData?.auditRef, doneEvent, 'approval', { actionId, toolId: action.toolId, result: result.result });
       setNotification('ACTION EXECUTED');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Bridge execution failed.';
@@ -356,18 +402,21 @@ const App: React.FC = () => {
         status: 'failed',
         error: message,
       }), failedEvent);
+      appendUiAudit(messageData?.auditRef, failedEvent, 'approval', { actionId, toolId: action.toolId, error: message });
       setNotification('ACTION FAILED');
     }
   };
 
   const handleRejectAction = (messageId: string, actionId: string) => {
     const action = findPendingAction(messageId, actionId);
+    const messageData = findMagiData(messageId);
     if (!action || action.status !== 'pending') return;
     const event = makeUiEvent('approval', action.actor, 'complete', `${action.toolId} rejected by user.`);
     updatePendingAction(messageId, actionId, current => ({
       ...current,
       status: 'rejected',
     }), event);
+    appendUiAudit(messageData?.auditRef, event, 'approval', { actionId, toolId: action.toolId, status: 'rejected' });
     setNotification('ACTION REJECTED');
   };
 
@@ -404,6 +453,7 @@ const App: React.FC = () => {
     setPrompt('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setStatus('SCANNING');
+    setLiveSynthesis('');
     setLiveStreamEvents([
       makeUiEvent('input', 'COMMANDER', 'complete', `Queued protocol (${userMsg.content.length} chars).`),
       makeUiEvent('scan', 'HARNESS', 'running', 'Loading markdown harness, memories, and runtime settings.'),
@@ -411,13 +461,17 @@ const App: React.FC = () => {
 
     setTimeout(async () => {
       setStatus('THINKING');
+      const runId = uuidv4();
       try {
         pushLiveEvent(makeUiEvent('council', 'HARNESS', 'running', 'Starting independent persona analysis.'));
         const result = await queryMagiSystem(userMsg.content, currentSession.messages, language, memories, {
           settings: harnessSettings,
           documents: harnessDocuments,
         }, {
+          sessionId: currentSession.id,
+          runId,
           onEvent: pushLiveEvent,
+          onTextDelta: event => setLiveSynthesis(event.fullText),
         });
         let maintenanceOpsCount = 0;
         
@@ -461,11 +515,25 @@ const App: React.FC = () => {
         ));
         setStatus('COMPLETE');
         setLiveStreamEvents(result.streamEvents || []);
+        setLiveSynthesis('');
       } catch (error) {
         console.error(error);
         setStatus('ERROR');
+        setLiveSynthesis('');
         const failureEvent = makeUiEvent('error', 'HARNESS', 'failed', error instanceof Error ? error.message : 'Unknown runtime error');
         pushLiveEvent(failureEvent);
+        appendAuditEvents(currentSession.id, [{
+          id: uuidv4(),
+          sessionId: currentSession.id,
+          runId,
+          timestamp: failureEvent.timestamp,
+          phase: failureEvent.phase,
+          actor: failureEvent.actor,
+          status: failureEvent.status,
+          summary: failureEvent.message,
+          details: failureEvent.details,
+          kind: 'error',
+        }]).catch(auditError => console.warn('Error audit append failed', auditError));
         // Add error message to chat
         const errorMsg: Message = {
           id: uuidv4(),
@@ -648,7 +716,7 @@ const App: React.FC = () => {
         </div>
         
         <div className="p-4 border-t border-magi-dim/30 text-[10px] text-magi-dim text-center tracking-[0.2em]">
-          MAGI HARNESS OS v7.0
+          MAGI HARNESS OS v8.0
         </div>
       </aside>
 
@@ -923,6 +991,19 @@ const App: React.FC = () => {
                                        </p>
                                      </div>
                                    )}
+                                   {msg.magiData.auditRef && (
+                                     <div className="mt-5 border-t border-gray-800 pt-4">
+                                       <div className="text-[10px] text-magi-dim uppercase tracking-[0.3em] font-bold mb-2">Audit Log</div>
+                                       <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[10px] text-gray-400 font-mono">
+                                         <div className="border border-gray-800 bg-black/30 p-2 break-all">session: {msg.magiData.auditRef.sessionId}</div>
+                                         <div className="border border-gray-800 bg-black/30 p-2 break-all">run: {msg.magiData.auditRef.runId}</div>
+                                         <div className="border border-gray-800 bg-black/30 p-2">{msg.magiData.auditRef.eventCount} events</div>
+                                         {msg.magiData.auditRef.filePath && (
+                                           <div className="md:col-span-3 border border-gray-800 bg-black/30 p-2 break-all">{msg.magiData.auditRef.filePath}</div>
+                                         )}
+                                       </div>
+                                     </div>
+                                   )}
                                    {msg.magiData.trace && msg.magiData.trace.length > 0 && (
                                      <details className="mt-5 border-t border-gray-800 pt-4 group">
                                        <summary className="cursor-pointer text-[10px] text-magi-melchior uppercase tracking-[0.3em] font-bold list-none flex items-center gap-2">
@@ -993,6 +1074,15 @@ const App: React.FC = () => {
                           </div>
                         </div>
                       ))}
+                    </div>
+                  </div>
+                )}
+                {liveSynthesis && (
+                  <div className="mt-6 border border-magi-melchior/40 bg-black/80 p-5 max-w-5xl mx-auto">
+                    <div className="text-[10px] text-magi-melchior tracking-[0.3em] uppercase font-bold mb-3">Live Synthesis</div>
+                    <div className="text-sm md:text-base leading-relaxed text-gray-100 font-mono whitespace-pre-wrap">
+                      {liveSynthesis}
+                      <span className="inline-block w-2 h-4 ml-1 bg-magi-melchior animate-pulse align-middle"></span>
                     </div>
                   </div>
                 )}

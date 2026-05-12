@@ -1,3 +1,5 @@
+import { AuditEvent } from '../types';
+
 export interface BridgeSkill {
   id: string;
   name: string;
@@ -11,6 +13,8 @@ export interface BridgeStatus {
   bridgeConfigPath: string | null;
   mcpConfigPath: string | null;
   storage?: BridgeStorageStatus;
+  auditDir?: string;
+  artifactDir?: string;
   allowSkillScripts: boolean;
   skills: BridgeSkill[];
   mcpServers: string[];
@@ -116,4 +120,40 @@ export const saveBridgeState = async (key: string, value: unknown): Promise<stri
     throw new Error(payload.error || `Bridge state save failed: ${response.status}`);
   }
   return payload.filePath;
+};
+
+export const appendAuditEvents = async (
+  sessionId: string,
+  events: AuditEvent[],
+): Promise<{ filePath: string; count: number }> => {
+  const response = await fetch(`/api/harness/bridge/audit/${encodeURIComponent(sessionId)}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ events }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `Audit append failed: ${response.status}`);
+  }
+  return {
+    filePath: payload.filePath,
+    count: payload.count,
+  };
+};
+
+export const readAuditEvents = async (
+  sessionId: string,
+  limit = 200,
+): Promise<{ filePath: string; events: AuditEvent[] }> => {
+  const response = await fetch(`/api/harness/bridge/audit/${encodeURIComponent(sessionId)}?limit=${encodeURIComponent(String(limit))}`);
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `Audit read failed: ${response.status}`);
+  }
+  return {
+    filePath: payload.filePath,
+    events: payload.events || [],
+  };
 };

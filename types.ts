@@ -109,6 +109,35 @@ export interface StreamEvent {
   message: string;
   timestamp: number;
   details?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TextDeltaEvent {
+  id: string;
+  role: 'synthesis';
+  delta: string;
+  fullText: string;
+  timestamp: number;
+}
+
+export interface AuditRef {
+  sessionId: string;
+  runId: string;
+  filePath?: string;
+  eventCount: number;
+}
+
+export interface AuditEvent {
+  id: string;
+  sessionId: string;
+  runId: string;
+  timestamp: number;
+  phase: string;
+  actor: string;
+  status: string;
+  summary: string;
+  details?: unknown;
+  kind?: 'stream' | 'trace' | 'tool' | 'approval' | 'error' | 'synthesis';
 }
 
 export interface MagiAnalysis {
@@ -155,6 +184,7 @@ export interface MagiResponse {
   pendingActions?: PendingAction[];
   clarificationRequests?: ClarificationRequest[];
   streamEvents?: StreamEvent[];
+  auditRef?: AuditRef;
   requiresUserInput?: boolean;
 }
 

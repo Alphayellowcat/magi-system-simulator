@@ -14,6 +14,8 @@ dist-ssr
 magi.bridge.json
 magi.mcp.json
 .magi/state/
+.magi/audit/
+.magi/artifacts/
 .magi/config/bridge.json
 .magi/mcp/servers.json
 
