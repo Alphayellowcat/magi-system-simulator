@@ -41,8 +41,23 @@ export interface BridgeToolResult {
   error?: string;
 }
 
+const getBridgeBaseUrl = () => {
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin;
+  }
+
+  const envBase = process.env.MAGI_BRIDGE_BASE_URL || process.env.VITE_DEV_SERVER_URL;
+  if (envBase) return envBase.replace(/\/$/, '');
+
+  const port = process.env.VITE_PORT || '3000';
+  return `http://127.0.0.1:${port}`;
+};
+
+const bridgeUrl = (path: string) =>
+  path.startsWith('http') ? path : `${getBridgeBaseUrl()}${path}`;
+
 export const getBridgeStatus = async (): Promise<BridgeStatus> => {
-  const response = await fetch('/api/harness/bridge/status');
+  const response = await fetch(bridgeUrl('/api/harness/bridge/status'));
   if (!response.ok) {
     throw new Error(`Bridge status failed: ${response.status}`);
   }
@@ -54,7 +69,7 @@ export const executeBridgeTool = async (
   args: Record<string, unknown>,
   actor = 'HARNESS',
 ): Promise<BridgeToolResult> => {
-  const response = await fetch('/api/harness/bridge/tools/execute', {
+  const response = await fetch(bridgeUrl('/api/harness/bridge/tools/execute'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -74,7 +89,7 @@ export const executeBridgeTool = async (
 };
 
 export const listMcpTools = async (server: string) => {
-  const response = await fetch('/api/harness/bridge/mcp/list-tools', {
+  const response = await fetch(bridgeUrl('/api/harness/bridge/mcp/list-tools'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -90,7 +105,7 @@ export const listMcpTools = async (server: string) => {
 };
 
 export const getBridgeStorageStatus = async (): Promise<BridgeStorageStatus> => {
-  const response = await fetch('/api/harness/bridge/storage/status');
+  const response = await fetch(bridgeUrl('/api/harness/bridge/storage/status'));
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || `Bridge storage status failed: ${response.status}`);
@@ -99,7 +114,7 @@ export const getBridgeStorageStatus = async (): Promise<BridgeStorageStatus> => 
 };
 
 export const loadBridgeState = async <T,>(key: string): Promise<T | null> => {
-  const response = await fetch(`/api/harness/bridge/storage/${encodeURIComponent(key)}`);
+  const response = await fetch(bridgeUrl(`/api/harness/bridge/storage/${encodeURIComponent(key)}`));
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || `Bridge state load failed: ${response.status}`);
@@ -108,7 +123,7 @@ export const loadBridgeState = async <T,>(key: string): Promise<T | null> => {
 };
 
 export const saveBridgeState = async (key: string, value: unknown): Promise<string> => {
-  const response = await fetch(`/api/harness/bridge/storage/${encodeURIComponent(key)}`, {
+  const response = await fetch(bridgeUrl(`/api/harness/bridge/storage/${encodeURIComponent(key)}`), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -126,7 +141,7 @@ export const appendAuditEvents = async (
   sessionId: string,
   events: AuditEvent[],
 ): Promise<{ filePath: string; count: number }> => {
-  const response = await fetch(`/api/harness/bridge/audit/${encodeURIComponent(sessionId)}`, {
+  const response = await fetch(bridgeUrl(`/api/harness/bridge/audit/${encodeURIComponent(sessionId)}`), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -147,7 +162,7 @@ export const readAuditEvents = async (
   sessionId: string,
   limit = 200,
 ): Promise<{ filePath: string; events: AuditEvent[] }> => {
-  const response = await fetch(`/api/harness/bridge/audit/${encodeURIComponent(sessionId)}?limit=${encodeURIComponent(String(limit))}`);
+  const response = await fetch(bridgeUrl(`/api/harness/bridge/audit/${encodeURIComponent(sessionId)}?limit=${encodeURIComponent(String(limit))}`));
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || `Audit read failed: ${response.status}`);

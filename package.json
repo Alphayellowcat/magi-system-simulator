@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "magi:cli": "node scripts/magi-cli.mjs run",
+    "magi:status": "node scripts/magi-cli.mjs status",
+    "magi:smoke": "node scripts/magi-cli.mjs smoke --bridge-only",
+    "magi:smoke:full": "node scripts/magi-cli.mjs smoke --full"
   },
   "dependencies": {
     "openai": "^4.0.0",

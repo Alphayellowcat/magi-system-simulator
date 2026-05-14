@@ -234,7 +234,9 @@ const searchTavily = async (
   query: string,
   settings: HarnessSettings,
 ): Promise<{ results: TavilyResult[]; sources: GroundingSource[] }> => {
-  const apiKey = settings.tavilyApiKey || import.meta.env.VITE_TAVILY_API_KEY;
+  const apiKey = settings.tavilyApiKey ||
+    (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_TAVILY_API_KEY ||
+    process.env.VITE_TAVILY_API_KEY;
   if (!apiKey) {
     console.warn('Tavily API key not found, skipping search.');
     return { results: [], sources: [] };

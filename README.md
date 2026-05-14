@@ -96,6 +96,24 @@ Vite 开发服务器现在会挂载一个本机 harness bridge：
 
 仓库内 `public/harness/*.md` 是默认模板；用户修改后的版本会进入 `.magi/state/documents.json`。`.magi/state/` 已被 `.gitignore` 忽略，避免把本机配置、密钥或会话历史提交出去。
 
+## 🧪 CLI 验证飞轮
+
+仓库内置命令行验证入口，方便绕过 UI 直接测试 bridge、MCP、三人格编排、流式 synthesis、审计日志与工具 trace：
+
+```bash
+npm run magi:status
+npm run magi:smoke
+npm run magi:smoke:full
+npm run magi:cli -- "请读取当前项目目录树，判断你能否看到本体代码"
+```
+
+- `magi:status`: 启动 Vite harness bridge，列出 runtime skills、MCP servers 和 tools。
+- `magi:smoke`: 只做确定性的 bridge/MCP smoke check，不调用模型。
+- `magi:smoke:full`: 在 smoke check 后跑一轮真实 MAGI prompt，并断言 `mcp.call`、`council-tools`、`synthesis-tools`、`synthesis-stream` 和 auditRef。
+- `magi:cli`: 运行单条 prompt；支持 `--format json|jsonl`、`--stream`、`--out <path>`、`--expect-tool <id>`、`--expect-phase <phase>`、`--save-session`。
+
+CLI 会读取 `.env.local`、`.magi/state/settings.json`、`.magi/state/documents.json` 和 `.magi/state/memories.json`，并为每次运行写入 `.magi/audit/<sessionId>.jsonl`。`smoke --full` 默认还会把 JSON 报告写入 `.magi/artifacts/cli/`。
+
 ## 本地运行
 
 **先决条件：** Node.js
