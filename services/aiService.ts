@@ -148,7 +148,10 @@ const safeParse = (text: string, archetype?: string) => {
   try {
     return JSON.parse(cleaned);
   } catch (error) {
-    console.error(`【${archetype || 'SYNTHESIS'}】JSON Parse Error:`, text);
+    console.warn(
+      `【${archetype || 'SYNTHESIS'}】JSON parse failed; using fallback when available. ` +
+      truncateForPrompt(text.replace(/\s+/g, ' '), 500),
+    );
     throw new Error('Invalid JSON response from model');
   }
 };
@@ -188,11 +191,18 @@ const createChatParams = (
   settings: HarnessSettings,
   body: {
     model: string;
-    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+    messages: Array<{
+      role: 'system' | 'user' | 'assistant' | 'tool';
+      content: string | null;
+      tool_call_id?: string;
+      tool_calls?: unknown[];
+    }>;
     temperature?: number;
     max_tokens?: number;
     response_format?: { type: 'json_object' };
     stream?: boolean;
+    tools?: unknown[];
+    tool_choice?: 'auto' | 'none';
   },
 ) => {
   const params: Record<string, unknown> = { ...body };
@@ -655,7 +665,8 @@ const formatRuntimeCapabilities = (runtime: RuntimeCapabilities, expanded: boole
   const hasBrowser = runtime.mcpServers.some(server => server.server === 'browser');
   const toolUseRules = hasFilesystem
     ? `- To inspect this repository or local code, request mcp.call against the filesystem server instead of asking the user to configure filesystem again.
-- Useful filesystem calls: list_allowed_directories {}, list_directory {"path":"."}, directory_tree {"path":".","excludePatterns":["node_modules","dist",".git",".magi/state"]}, search_files {"path":".","pattern":"**/*.ts"}, read_text_file {"path":"App.tsx","head":200}.
+- Useful filesystem calls: list_allowed_directories {}, list_directory {"path":"."}, directory_tree {"path":".","excludePatterns":["node_modules","dist",".git",".magi/state",".magi/audit",".magi/artifacts","output"]}, search_files {"path":".","pattern":"**/*.ts"}, read_text_file {"path":"App.tsx","head":200}.
+- For top-level code visibility, prefer list_directory {"path":"."} before directory_tree; it is shorter and less likely to hide source files behind a large tree dump.
 - Mutating filesystem tools such as write_file, edit_file, move_file, create_directory require user approval.`
     : '- No filesystem MCP server is currently listed by the bridge. Do not claim local file access unless a filesystem server appears in the manifest.';
   const browserRules = hasBrowser
@@ -721,6 +732,216 @@ const appendUniqueToolRequest = (
   }
 };
 
+const nativePlanningTools = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search_tavily',
+      description: 'Search the web through Tavily. Read-only and low risk.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'One focused search query.',
+          },
+          reason: {
+            type: 'string',
+            description: 'Brief reason this search is needed.',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'skill_run',
+      description: 'Load or run a local MAGI/Codex skill package. Use mode=load for reading SKILL.md instructions.',
+      parameters: {
+        type: 'object',
+        properties: {
+          skill: {
+            type: 'string',
+            description: 'Runtime skill id or name.',
+          },
+          task: {
+            type: 'string',
+            description: 'What you need from the skill.',
+          },
+          mode: {
+            type: 'string',
+            enum: ['load', 'script'],
+            description: 'Use load unless the user explicitly needs an approved script action.',
+          },
+          script: {
+            type: 'string',
+            description: 'Optional script path inside the skill for script mode.',
+          },
+          args: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional script arguments.',
+          },
+          reason: {
+            type: 'string',
+            description: 'Brief reason this skill is needed.',
+          },
+        },
+        required: ['skill'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'mcp_call',
+      description: 'Call a configured MCP server tool through the MAGI bridge. Read-only tools may run automatically; risky tools enter approval.',
+      parameters: {
+        type: 'object',
+        properties: {
+          server: {
+            type: 'string',
+            description: 'Configured MCP server id, such as filesystem or browser.',
+          },
+          tool: {
+            type: 'string',
+            description: 'MCP tool name on that server.',
+          },
+          arguments: {
+            type: 'object',
+            description: 'Arguments to pass to the MCP tool.',
+            additionalProperties: true,
+          },
+          reason: {
+            type: 'string',
+            description: 'Brief reason this MCP call is needed.',
+          },
+        },
+        required: ['server', 'tool', 'arguments'],
+        additionalProperties: false,
+      },
+    },
+  },
+] as const;
+
+const parseNativeToolArguments = (raw: unknown): Record<string, unknown> => {
+  if (!raw) return {};
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  if (typeof raw !== 'string') return {};
+
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    console.warn(`Native tool arguments were not valid JSON: ${truncateForPrompt(raw, 300)}`);
+    return {};
+  }
+};
+
+const nativeToolCallToRequest = (toolCall: unknown): PlannedToolRequest | null => {
+  if (!toolCall || typeof toolCall !== 'object') return null;
+  const call = toolCall as {
+    function?: {
+      name?: string;
+      arguments?: unknown;
+    };
+  };
+  const name = call.function?.name;
+  const args = parseNativeToolArguments(call.function?.arguments);
+  const reason = typeof args.reason === 'string' ? args.reason : '';
+
+  if (name === 'web_search_tavily') {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) return null;
+    return {
+      toolId: 'web.search.tavily',
+      arguments: {
+        query,
+      },
+      reason,
+    };
+  }
+
+  if (name === 'skill_run') {
+    const skill = typeof args.skill === 'string' ? args.skill.trim() : '';
+    if (!skill) return null;
+    const { reason: _reason, ...skillArgs } = args;
+    return {
+      toolId: 'skill.run',
+      arguments: {
+        ...skillArgs,
+        skill,
+        mode: typeof skillArgs.mode === 'string' ? skillArgs.mode : 'load',
+      },
+      reason,
+    };
+  }
+
+  if (name === 'mcp_call') {
+    const server = typeof args.server === 'string' ? args.server.trim() : '';
+    const tool = typeof args.tool === 'string' ? args.tool.trim() : '';
+    if (!server || !tool) return null;
+    return {
+      toolId: 'mcp.call',
+      arguments: {
+        server,
+        tool,
+        arguments: args.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments)
+          ? args.arguments
+          : {},
+      },
+      reason,
+    };
+  }
+
+  return null;
+};
+
+const planNativeToolCalls = async (
+  client: OpenAI,
+  modelName: string,
+  settings: HarnessSettings,
+  promptText: string,
+  fallbackLabel: string,
+  maxRequests: number,
+) => {
+  const response = await client.chat.completions.create(createChatParams(settings, {
+    model: modelName,
+    messages: [{ role: 'system', content: promptText }],
+    temperature: 0.1,
+    max_tokens: 1024,
+    tools: nativePlanningTools as unknown as unknown[],
+    tool_choice: 'auto',
+  }) as any);
+
+  const message = response.choices[0]?.message as { tool_calls?: unknown[]; content?: string } | undefined;
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+  if (toolCalls.length === 0) return [];
+
+  const planned: PlannedToolRequest[] = [];
+  toolCalls
+    .map(nativeToolCallToRequest)
+    .filter((request): request is PlannedToolRequest => Boolean(request))
+    .forEach(request => appendUniqueToolRequest(planned, request));
+
+  if (planned.length > 0) {
+    console.info(`[${fallbackLabel}] Native tool_calls planned ${planned.length} request(s).`);
+  }
+
+  return planned.slice(0, maxRequests);
+};
+
+const extractReferencedFilePath = (userQuery: string) => {
+  const match = userQuery.match(/(?:[\w.-]+[\\/])*[\w.-]+\.(?:json|md|tsx?|jsx?|mjs|cjs|css|html|yml|yaml|toml|txt|log)/i);
+  return match?.[0]?.replace(/\\/g, '/') || '';
+};
+
 const suggestRuntimeToolRequests = (
   systemType: MagiSystem,
   userQuery: string,
@@ -728,27 +949,48 @@ const suggestRuntimeToolRequests = (
 ): PlannedToolRequest[] => {
   const query = userQuery.toLowerCase();
   const requests: PlannedToolRequest[] = [];
-  const asksAboutFiles = /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|readme|repo|repository|source|file|directory|codebase|filesystem|mcp/.test(query);
+  const asksAboutFiles = /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|readme|repo|repository|source|file|directory|codebase|filesystem/.test(query);
   const asksAboutSkills = /skill|技能|能力包|加载|详情|instructions|skill\.md/.test(query);
   const asksAboutBrowsing = /浏览|网页|搜索|联网|browser|web|search/.test(query);
+  const referencedFile = extractReferencedFilePath(userQuery);
   const urlMatch = userQuery.match(/https?:\/\/[^\s"'<>]+|localhost:\d+[^\s"'<>]*|127\.0\.0\.1:\d+[^\s"'<>]*/i);
   const browserUrl = urlMatch
     ? (urlMatch[0].startsWith('http') ? urlMatch[0] : `http://${urlMatch[0]}`)
     : '';
 
-  if (asksAboutFiles && runtimeHasMcpTool(runtime, 'filesystem', 'directory_tree')) {
-    if (systemType === MagiSystem.MELCHIOR) {
+  const hasFilesystemDirectoryRead = runtimeHasMcpTool(runtime, 'filesystem', 'list_directory') ||
+    runtimeHasMcpTool(runtime, 'filesystem', 'directory_tree') ||
+    runtimeHasMcpTool(runtime, 'filesystem', 'read_text_file');
+
+  if (asksAboutFiles && hasFilesystemDirectoryRead) {
+    if (systemType === MagiSystem.MELCHIOR && referencedFile && runtimeHasMcpTool(runtime, 'filesystem', 'read_text_file')) {
       appendUniqueToolRequest(requests, {
         toolId: 'mcp.call',
         arguments: {
           server: 'filesystem',
-          tool: 'directory_tree',
+          tool: 'read_text_file',
           arguments: {
-            path: '.',
-            excludePatterns: ['node_modules', 'dist', '.git', '.magi/state'],
+            path: referencedFile,
+            head: 260,
           },
         },
-        reason: 'The user is asking about local project/code capability; inspect the repository tree through filesystem MCP.',
+        reason: `The user asked about ${referencedFile}; read that file directly through filesystem MCP.`,
+      });
+    } else if (systemType === MagiSystem.MELCHIOR) {
+      const useListDirectory = runtimeHasMcpTool(runtime, 'filesystem', 'list_directory');
+      appendUniqueToolRequest(requests, {
+        toolId: 'mcp.call',
+        arguments: {
+          server: 'filesystem',
+          tool: useListDirectory ? 'list_directory' : 'directory_tree',
+          arguments: useListDirectory
+            ? { path: '.' }
+            : {
+              path: '.',
+              excludePatterns: ['node_modules', 'dist', '.git', '.magi/state', '.magi/audit', '.magi/artifacts', 'output'],
+            },
+        },
+        reason: 'The user is asking about local project/code capability; inspect the repository root through filesystem MCP.',
       });
     }
 
@@ -814,9 +1056,10 @@ const suggestRuntimeToolRequests = (
       });
     }
 
+    const wantsBrowserSkillDetails = asksAboutSkills || /浏览器能力|浏览器技能|browser capability|browser skill|browser-verification/i.test(userQuery);
     const browserSkill = runtime.bridge.skills.find(skill => skill.id === 'browser') ||
       runtime.bridge.skills.find(skill => skill.id === 'browser-verification');
-    if (browserSkill && runtimeHasSkill(runtime, browserSkill.id)) {
+    if (systemType === MagiSystem.CASPER && wantsBrowserSkillDetails && browserSkill && runtimeHasSkill(runtime, browserSkill.id)) {
       appendUniqueToolRequest(requests, {
         toolId: 'skill.run',
         arguments: {
@@ -898,6 +1141,12 @@ const shouldKeepClarification = (
 
 const shouldPersonaOwnToolRequest = (systemType: MagiSystem, request: PlannedToolRequest) => {
   if (request.toolId === 'web.search.tavily') return systemType === MagiSystem.MELCHIOR;
+
+  if (request.toolId === 'skill.run') {
+    const skill = typeof request.arguments?.skill === 'string' ? request.arguments.skill.toLowerCase() : '';
+    if (/browser|visual|ui|verification/.test(skill)) return systemType === MagiSystem.CASPER;
+    if (/mcp|tool|permission|safety|audit/.test(skill)) return systemType === MagiSystem.BALTHASAR;
+  }
 
   if (request.toolId === 'mcp.call') {
     const server = typeof request.arguments?.server === 'string' ? request.arguments.server : '';
@@ -1025,12 +1274,12 @@ You are ${config.name}. Decide whether any permitted tools are useful at this fi
 
 ${harnessBlock}
 
-Available tool request shapes:
-- web.search.tavily: { "query": "single focused search query" }
-- skill.run: { "skill": "skill name", "task": "what you need from the skill", "mode": "load" }
-- mcp.call: { "server": "configured MCP server id", "tool": "server tool name", "arguments": {} }
+You have native function tools available:
+- web_search_tavily -> web.search.tavily
+- skill_run -> skill.run
+- mcp_call -> mcp.call
 
-Request only tools that are directly useful and permissioned by the registry. Prefer at most two requests.
+Call only tools that are directly useful and permissioned by the registry. Prefer at most two calls. If no tool is useful, return no tool calls.
 
 Important:
 - The Authoritative Runtime Tool Manifest is live. Trust it over stale memory.
@@ -1041,60 +1290,22 @@ Important:
 - If the user asks for skill details and a matching runtime skill is listed, request skill.run with mode "load".
 
 Concrete examples when filesystem MCP is available:
-- repository tree: { "toolId": "mcp.call", "arguments": { "server": "filesystem", "tool": "directory_tree", "arguments": { "path": ".", "excludePatterns": ["node_modules", "dist", ".git", ".magi/state"] } }, "reason": "Inspect project tree" }
-- read file: { "toolId": "mcp.call", "arguments": { "server": "filesystem", "tool": "read_text_file", "arguments": { "path": "App.tsx", "head": 160 } }, "reason": "Inspect source file" }
-- skill details: { "toolId": "skill.run", "arguments": { "skill": "browser-verification", "task": "Load SKILL.md", "mode": "load" }, "reason": "Inspect skill instructions" }
+- repository root: call mcp_call with server="filesystem", tool="list_directory", arguments={ "path": "." }
+- repository tree: call mcp_call with server="filesystem", tool="directory_tree", arguments={ "path": ".", "excludePatterns": ["node_modules", "dist", ".git", ".magi/state", ".magi/audit", ".magi/artifacts", "output"] }
+- read file: call mcp_call with server="filesystem", tool="read_text_file", arguments={ "path": "App.tsx", "head": 160 }
+- skill details: call skill_run with skill="browser-verification", task="Load SKILL.md", mode="load"
 
 Concrete examples when browser MCP is available:
-- navigate: { "toolId": "mcp.call", "arguments": { "server": "browser", "tool": "browser_navigate", "arguments": { "url": "http://localhost:4123/", "waitUntil": "domcontentloaded" } }, "reason": "Open page for browser verification" }
-- read page: { "toolId": "mcp.call", "arguments": { "server": "browser", "tool": "browser_read_page", "arguments": { "maxChars": 12000 } }, "reason": "Read current page" }
-- screenshot: { "toolId": "mcp.call", "arguments": { "server": "browser", "tool": "browser_screenshot", "arguments": { "name": "magi-ui", "fullPage": true } }, "reason": "Capture visual artifact" }
+- navigate: call mcp_call with server="browser", tool="browser_navigate", arguments={ "url": "http://localhost:4123/", "waitUntil": "domcontentloaded" }
+- read page: call mcp_call with server="browser", tool="browser_read_page", arguments={ "maxChars": 12000 }
+- screenshot: call mcp_call with server="browser", tool="browser_screenshot", arguments={ "name": "magi-ui", "fullPage": true }
 - click/type are high-risk browser actions and should be requested only when the user asked for that interaction.
-
-Return JSON only:
-{
-  "requests": [
-    {
-      "toolId": "web.search.tavily | skill.run | mcp.call",
-      "arguments": {},
-      "reason": "brief reason"
-    }
-  ]
-}
 
 User query: "${userQuery}"
 `;
 
   try {
-    const response = await client.chat.completions.create(createChatParams(settings, {
-      model: modelName,
-      messages: [{ role: 'system', content: prompt }],
-      temperature: 0.2,
-      max_tokens: 300,
-      response_format: { type: 'json_object' },
-    }) as any);
-
-    const text = response.choices[0]?.message?.content;
-    if (!text) return suggestRuntimeToolRequests(systemType, userQuery, runtime);
-    const parsed = safeParse(text, `${config.name} TOOL PLANNER`) as { requests?: unknown };
-    if (!Array.isArray(parsed.requests)) return suggestRuntimeToolRequests(systemType, userQuery, runtime);
-
-    const planned = parsed.requests
-      .filter((request): request is PlannedToolRequest => {
-        if (!request || typeof request !== 'object') return false;
-        const candidate = request as PlannedToolRequest;
-        return candidate.toolId === 'web.search.tavily' ||
-          candidate.toolId === 'skill.run' ||
-          candidate.toolId === 'mcp.call';
-      })
-      .slice(0, 2)
-      .map(request => ({
-        toolId: request.toolId,
-        arguments: request.arguments && typeof request.arguments === 'object' && !Array.isArray(request.arguments)
-          ? request.arguments
-          : {},
-        reason: typeof request.reason === 'string' ? request.reason : '',
-      }));
+    const planned = await planNativeToolCalls(client, modelName, settings, prompt, `${config.name} TOOL PLANNER`, 2);
     if (planned.length === 0) {
       return suggestRuntimeToolRequests(systemType, userQuery, runtime);
     }
@@ -1204,7 +1415,11 @@ const executeToolRequests = async (
         request: request.arguments || {},
         result: bridgeResult.result,
       });
-      toolResultBlocks.push(`### ${config.name} used ${request.toolId}\nReason: ${request.reason || 'No reason supplied.'}\nResult:\n${details}`);
+      const promptDetails = truncateForPrompt({
+        request: request.arguments || {},
+        result: bridgeResult.result,
+      }, 5000);
+      toolResultBlocks.push(`### ${config.name} used ${request.toolId}\nReason: ${request.reason || 'No reason supplied.'}\nResult:\n${promptDetails}`);
       toolTraces.push({
         systemName: config.name,
         toolId: request.toolId,
@@ -1329,7 +1544,7 @@ User query: "${userQuery}"
       model: modelName,
       messages: [{ role: 'system', content: archetypePrompt }],
       temperature: 0.7,
-      max_tokens: 8192,
+      max_tokens: 3072,
       response_format: { type: 'json_object' },
     }) as any);
 
@@ -1410,8 +1625,8 @@ const planCouncilTools = async (
   const client = createClient(harness.settings);
   const modelName = getModelName(harness.settings);
   const langInstruction = language === 'CN'
-    ? 'Think in Chinese and return JSON only.'
-    : 'Think in English and return JSON only.';
+    ? 'Think in Chinese.'
+    : 'Think in English.';
   const ownOutput = initialOutputs[systemType];
   const toolAudit = existingToolTraces.map(trace =>
     `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 800)}`,
@@ -1439,48 +1654,17 @@ ${toolAudit}
 ${formatPendingActions(pendingActions)}
 
 Rules:
-- Do not ask the user for permission to run low-risk read-only tools; request the tool now.
-- If a factual claim can be checked with an available read-only tool, request it.
+- You have native function tools available: web_search_tavily, skill_run, mcp_call.
+- Do not ask the user for permission to run low-risk read-only tools; call the tool now.
+- If a factual claim can be checked with an available read-only tool, call the tool.
 - Avoid repeating a tool call that already has a useful result in Tool Audit.
 - Risky click/type/write actions may be requested, but they will enter the approval queue.
-- Return no requests when no additional action is useful.
-
-Return JSON only:
-{
-  "requests": [
-    { "toolId": "web.search.tavily | skill.run | mcp.call", "arguments": {}, "reason": "brief reason" }
-  ]
-}
+- Return no tool calls when no additional action is useful.
 `;
 
   try {
-    const response = await client.chat.completions.create(createChatParams(harness.settings, {
-      model: modelName,
-      messages: [{ role: 'system', content: promptText }],
-      temperature: 0.2,
-      max_tokens: 300,
-      response_format: { type: 'json_object' },
-    }) as any);
-    const text = response.choices[0]?.message?.content;
-    if (!text) return [];
-    const parsed = safeParse(text, `${config.name} COUNCIL TOOL PLANNER`) as { requests?: unknown };
-    if (!Array.isArray(parsed.requests)) return [];
-
-    return parsed.requests
-      .filter((request): request is PlannedToolRequest => {
-        if (!request || typeof request !== 'object') return false;
-        const candidate = request as PlannedToolRequest;
-        return candidate.toolId === 'web.search.tavily' ||
-          candidate.toolId === 'skill.run' ||
-          candidate.toolId === 'mcp.call';
-      })
-      .map(request => ({
-        toolId: request.toolId,
-        arguments: request.arguments && typeof request.arguments === 'object' && !Array.isArray(request.arguments)
-          ? request.arguments
-          : {},
-        reason: typeof request.reason === 'string' ? request.reason : '',
-      }))
+    const planned = await planNativeToolCalls(client, modelName, harness.settings, promptText, `${config.name} COUNCIL TOOL PLANNER`, 1);
+    return planned
       .filter(request => shouldPersonaOwnToolRequest(systemType, request))
       .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces))
       .slice(0, 1);
@@ -1503,8 +1687,8 @@ const planSynthesisTools = async (
   const client = createClient(harness.settings);
   const modelName = getModelName(harness.settings);
   const langInstruction = language === 'CN'
-    ? 'Think in Chinese and return JSON only.'
-    : 'Think in English and return JSON only.';
+    ? 'Think in Chinese.'
+    : 'Think in English.';
   const personaBrief = Object.values(MagiSystem).map(systemType => {
     const output = initialOutputs[systemType];
     return `[${output.systemName}]\nAnalysis: ${output.analysis}\nProposal: ${output.proposal}\nVote: ${output.vote ? 'APPROVE' : 'REJECT'}`;
@@ -1536,48 +1720,17 @@ ${toolAudit}
 ${formatPendingActions(pendingActions)}
 
 Rules:
+- You have native function tools available: web_search_tavily, skill_run, mcp_call.
 - This is the final pre-answer action checkpoint. If a permitted tool can settle a remaining factual, file, browser, skill, or MCP uncertainty, request it now.
-- Do not ask the user for permission to run low-risk read-only tools. Use them.
+- Do not ask the user for permission to run low-risk read-only tools. Call them.
 - Avoid repeating useful tool calls already present in Tool Audit.
 - Risky click/type/write/execute actions may be requested, but they will become pending approvals.
-- Return no requests when the answer can already be grounded in existing tool results.
-
-Return JSON only:
-{
-  "requests": [
-    { "toolId": "web.search.tavily | skill.run | mcp.call", "arguments": {}, "reason": "brief reason" }
-  ]
-}
+- Return no tool calls when the answer can already be grounded in existing tool results.
 `;
 
   try {
-    const response = await client.chat.completions.create(createChatParams(harness.settings, {
-      model: modelName,
-      messages: [{ role: 'system', content: promptText }],
-      temperature: 0.2,
-      max_tokens: 420,
-      response_format: { type: 'json_object' },
-    }) as any);
-    const text = response.choices[0]?.message?.content;
-    if (!text) return [];
-    const parsed = safeParse(text, 'SYNTHESIS TOOL PLANNER') as { requests?: unknown };
-    if (!Array.isArray(parsed.requests)) return [];
-
-    return parsed.requests
-      .filter((request): request is PlannedToolRequest => {
-        if (!request || typeof request !== 'object') return false;
-        const candidate = request as PlannedToolRequest;
-        return candidate.toolId === 'web.search.tavily' ||
-          candidate.toolId === 'skill.run' ||
-          candidate.toolId === 'mcp.call';
-      })
-      .map(request => ({
-        toolId: request.toolId,
-        arguments: request.arguments && typeof request.arguments === 'object' && !Array.isArray(request.arguments)
-          ? request.arguments
-          : {},
-        reason: typeof request.reason === 'string' ? request.reason : '',
-      }))
+    const planned = await planNativeToolCalls(client, modelName, harness.settings, promptText, 'SYNTHESIS TOOL PLANNER', 2);
+    return planned
       .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces))
       .slice(0, 2);
   } catch (error) {
@@ -1664,23 +1817,49 @@ Return JSON only:
 
   try {
     emitStreamEvent(streamEvents, onEvent, 'meeting', config.name, 'running', 'Entering council meeting round.');
-    const response = await client.chat.completions.create(createChatParams(harness.settings, {
-      model: modelName,
-      messages: [{ role: 'system', content: promptText }],
-      temperature: 0.6,
-      max_tokens: 4096,
-      response_format: { type: 'json_object' },
-    }) as any);
-
-    const text = response.choices[0]?.message?.content;
-    if (!text) throw new Error(`${config.name} meeting silence.`);
-
-    const parsed = safeParse(text, `${config.name} MEETING`) as {
+    let parsed: {
       content?: string;
       revisedProposal?: string;
       revisedVote?: boolean;
       clarificationRequests?: unknown;
-    };
+    } | undefined;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        if (attempt > 0) {
+          emitStreamEvent(streamEvents, onEvent, 'meeting', config.name, 'running', 'Retrying compact council JSON response.');
+        }
+        const response = await client.chat.completions.create(createChatParams(harness.settings, {
+          model: modelName,
+          messages: [{
+            role: 'system',
+            content: attempt === 0
+              ? promptText
+              : `${promptText}\n\nRetry instruction: return a compact valid JSON object only. Keep content and revisedProposal short.`,
+          }],
+          temperature: attempt === 0 ? 0.6 : 0.2,
+          max_tokens: attempt === 0 ? 4096 : 2048,
+          response_format: { type: 'json_object' },
+        }) as any);
+
+        const text = response.choices[0]?.message?.content;
+        if (!text) throw new Error(`${config.name} meeting silence.`);
+        parsed = safeParse(text, `${config.name} MEETING`) as {
+          content?: string;
+          revisedProposal?: string;
+          revisedVote?: boolean;
+          clarificationRequests?: unknown;
+        };
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (!parsed) {
+      throw lastError instanceof Error ? lastError : new Error(`${config.name} meeting response failed.`);
+    }
 
     const exchange: CouncilExchange = {
       id: makeId('exchange'),
@@ -1773,6 +1952,7 @@ Rules:
 - Lead with the answer or completed action result, not the council process.
 - If pending actions require approval, clearly say they are waiting and do not claim they have executed.
 - If user input is required, ask the focused question(s) implied by the draft; do not ask for confirmation to run low-risk tools that already ran.
+- If the user requested an exact marker, token, phrase, or output sentinel, include it verbatim and do not paraphrase it.
 - Preserve the substance of the structured council result.
 `;
 
@@ -2170,6 +2350,7 @@ If the pending action queue is not empty, do not claim those actions have execut
 If low-risk read-only tools have already run, answer from their results instead of asking whether to run them.
 If the next safe step depends on genuinely missing user intent, credentials, destructive changes, or a risky action approval, set requiresUserInput true and ask focused questions.
 If runtime bridge is online and filesystem MCP tools are listed, do not say the system cannot inspect local files. Instead summarize tool results or state which mcp.call should be approved/executed next.
+If the user requested an exact marker, token, phrase, or output sentinel, preserve it verbatim in synthesis.
 `;
 
   emit('synthesis', 'COUNCIL', 'running', 'Integrating votes, meeting transcript, and action queue.');

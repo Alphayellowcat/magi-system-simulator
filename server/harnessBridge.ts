@@ -732,10 +732,18 @@ export const harnessBridgePlugin = (root: string): Plugin => ({
   name: 'magi-harness-bridge',
   configureServer(server) {
     const stdioClients = new Map<string, StdioMcpClient>();
-    server.httpServer?.on('close', () => {
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       stdioClients.forEach(client => client.close());
       stdioClients.clear();
-    });
+    };
+    const registerCleanup = () => {
+      server.httpServer?.once('close', cleanup);
+      server.watcher?.once('close', cleanup);
+    };
+    registerCleanup();
 
     server.middlewares.use(async (req, res, next) => {
       if (!req.url?.startsWith('/api/harness/bridge')) {
@@ -854,5 +862,9 @@ export const harnessBridgePlugin = (root: string): Plugin => ({
         });
       }
     });
+
+    return () => {
+      registerCleanup();
+    };
   },
 });

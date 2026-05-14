@@ -12,6 +12,16 @@ const artifactDir = path.resolve(
 let browser;
 let page;
 let buffer = '';
+let shuttingDown = false;
+
+const cleanup = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await page?.close().catch(() => {});
+  await browser?.close().catch(() => {});
+  page = undefined;
+  browser = undefined;
+};
 
 const launchBrowser = async () => {
   try {
@@ -263,6 +273,18 @@ process.stdin.on('data', chunk => {
       send(null, null, error);
     }
   }
+});
+
+process.stdin.on('end', () => {
+  cleanup().finally(() => process.exit(0));
+});
+
+process.on('SIGTERM', () => {
+  cleanup().finally(() => process.exit(0));
+});
+
+process.on('SIGINT', () => {
+  cleanup().finally(() => process.exit(0));
 });
 
 const shutdown = async () => {

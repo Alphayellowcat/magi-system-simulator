@@ -9,7 +9,7 @@ process.noDeprecation = true;
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const COMMANDS = new Set(['run', 'smoke', 'status', 'help']);
-const DEFAULT_SMOKE_PROMPT = '请通过 filesystem MCP 读取当前项目目录树，判断 MAGI 是否能看到本体代码。直接给结论和证据。';
+const DEFAULT_SMOKE_PROMPT = '请通过 filesystem MCP 读取当前项目根目录列表，判断 MAGI 是否能看到本体代码。若看到 App.tsx 或 package.json，最终回答第一行必须原样写出 MAGI_CAN_SEE_CODE_YES，并给出证据。';
 
 const usage = () => `MAGI CLI verification flywheel
 
@@ -35,7 +35,11 @@ Useful flags:
   --out <path>              Write a JSON report artifact.
   --expect-tool <id>        Assert that a tool id appears in tool traces. Repeatable or comma-separated.
   --expect-phase <phase>    Assert that a stream phase appears. Repeatable or comma-separated.
+  --expect-text <text>      Assert that final synthesis contains text. Repeatable.
   --expect-audit            Assert that auditRef exists.
+  --expect-no-offline       Assert that no persona fell back to NODE OFFLINE.
+  --expect-no-failed-events Assert that no stream events have status=failed.
+  --expect-pending          Assert that at least one action is pending approval.
   --bridge-only             Smoke command: skip the real LLM prompt.
   --full                    Smoke command: include the real LLM prompt.
   --quiet                   Suppress live progress in text mode.
@@ -63,7 +67,11 @@ const parseArgs = argv => {
     language: '',
     expectTools: [],
     expectPhases: [],
+    expectTexts: [],
     expectAudit: false,
+    expectNoOffline: false,
+    expectNoFailedEvents: false,
+    expectPending: false,
   };
 
   const positionals = [];
@@ -97,7 +105,11 @@ const parseArgs = argv => {
     else if (token === '--lang' || token === '--language') args.language = next().toUpperCase();
     else if (token === '--expect-tool') args.expectTools.push(...splitList(next()));
     else if (token === '--expect-phase') args.expectPhases.push(...splitList(next()));
+    else if (token === '--expect-text') args.expectTexts.push(next());
     else if (token === '--expect-audit') args.expectAudit = true;
+    else if (token === '--expect-no-offline') args.expectNoOffline = true;
+    else if (token === '--expect-no-failed-events') args.expectNoFailedEvents = true;
+    else if (token === '--expect-pending') args.expectPending = true;
     else if (token.startsWith('--')) throw new Error(`Unknown flag: ${token}`);
     else positionals.push(token);
   }
@@ -289,6 +301,12 @@ const countBy = values => values.reduce((acc, value) => {
 
 const summarizeResponse = (response, streamEvents, textDeltaCount, latencyMs) => {
   const toolTraces = response.toolTraces || [];
+  const offlinePersonas = ['melchior', 'balthasar', 'casper']
+    .filter(key => /OFFLINE|TIMEOUT OR HARNESS FAILURE|NODE OFFLINE/i.test(response[key]?.analysis || ''))
+    .map(key => response[key]?.systemName || key);
+  const failedEvents = streamEvents
+    .filter(event => event.status === 'failed')
+    .map(event => `${event.phase}:${event.actor}:${event.message}`);
   return {
     latencyMs,
     finalDecision: response.finalDecision,
@@ -306,6 +324,8 @@ const summarizeResponse = (response, streamEvents, textDeltaCount, latencyMs) =>
     toolStatus: countBy(toolTraces.map(trace => trace.status)),
     pendingActions: response.pendingActions?.length || 0,
     clarifications: response.clarificationRequests?.length || 0,
+    offlinePersonas,
+    failedEvents,
     auditRef: response.auditRef,
   };
 };
@@ -327,6 +347,12 @@ const printTextReport = (report, streamed) => {
   process.stdout.write(`Latency: ${report.summary.latencyMs}ms\n`);
   process.stdout.write(`Decision: ${report.summary.requiresUserInput ? 'WAIT' : report.summary.finalDecision ? 'YES' : 'NO'}\n`);
   process.stdout.write(`Tools: ${report.summary.tools.length} trace(s); pending=${report.summary.pendingActions}; clarifications=${report.summary.clarifications}\n`);
+  if (report.summary.offlinePersonas.length > 0) {
+    process.stdout.write(`Offline personas: ${report.summary.offlinePersonas.join(', ')}\n`);
+  }
+  if (report.summary.failedEvents.length > 0) {
+    process.stdout.write(`Failed events: ${report.summary.failedEvents.join('; ')}\n`);
+  }
   if (report.summary.auditRef?.filePath) {
     process.stdout.write(`Audit: ${report.summary.auditRef.filePath}\n`);
   }
@@ -346,8 +372,20 @@ const assertReport = (report, args) => {
   args.expectPhases.forEach(phase => {
     if (!phases.has(phase)) failures.push(`Expected stream phase not found: ${phase}`);
   });
+  args.expectTexts.forEach(text => {
+    if (!report.response.synthesis?.includes(text)) failures.push(`Expected final synthesis to contain: ${text}`);
+  });
   if (args.expectAudit && !report.response.auditRef) {
     failures.push('Expected auditRef, but none was returned.');
+  }
+  if (args.expectNoOffline && report.summary.offlinePersonas.length > 0) {
+    failures.push(`Expected no offline personas, but got: ${report.summary.offlinePersonas.join(', ')}`);
+  }
+  if (args.expectNoFailedEvents && report.summary.failedEvents.length > 0) {
+    failures.push(`Expected no failed events, but got: ${report.summary.failedEvents.join('; ')}`);
+  }
+  if (args.expectPending && report.summary.pendingActions < 1) {
+    failures.push('Expected at least one pending approval action, but none was returned.');
   }
 
   if (failures.length > 0) {
@@ -553,7 +591,10 @@ const main = async () => {
 
       args.expectTools.push(...(args.expectTools.length ? [] : ['mcp.call']));
       args.expectPhases.push(...(args.expectPhases.length ? [] : ['council-tools', 'synthesis-tools', 'synthesis-stream']));
+      args.expectTexts.push(...(args.expectTexts.length ? [] : ['MAGI_CAN_SEE_CODE_YES']));
       args.expectAudit = true;
+      args.expectNoOffline = true;
+      args.expectNoFailedEvents = true;
       await runPrompt(ctx, args.prompt || DEFAULT_SMOKE_PROMPT, args);
       return;
     }

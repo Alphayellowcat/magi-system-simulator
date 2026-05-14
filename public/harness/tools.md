@@ -2,6 +2,8 @@
 
 This document declares the tool surface and per-persona permissions. Browser-safe tools run directly in the app; local tools run through the Node harness bridge exposed by the Vite dev server.
 
+Planning uses model-native function `tool_calls`. The model sees provider-facing function names (`web_search_tavily`, `skill_run`, `mcp_call`); the MAGI host maps those calls to the canonical registry ids below, applies permission/risk checks, executes allowed read-only actions, and queues risky actions for approval. The model never executes functions by itself.
+
 ## Tools
 
 ### web.search.tavily
