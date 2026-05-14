@@ -129,11 +129,11 @@ const MagiNode: React.FC<MagiNodeProps> = ({ systemType, data, isLoading }) => {
         <div className="mt-auto border-t border-magi-dim/30">
           {data.vote ? (
              <div className={`w-full py-4 text-center text-black font-display text-2xl tracking-widest uppercase ${config.voteYesBg} animate-in zoom-in duration-300`}>
-               APPROVAL
+               VOTE YES
              </div>
           ) : (
              <div className="w-full py-4 text-center text-white bg-red-700 font-display text-2xl tracking-widest uppercase animate-in zoom-in duration-300 pattern-diagonal-lines">
-               DENIAL
+               VOTE NO
              </div>
           )}
         </div>

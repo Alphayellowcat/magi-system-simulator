@@ -801,13 +801,13 @@ const App: React.FC = () => {
                     <div className="absolute left-1/2 -top-12 bottom-0 w-[1px] bg-gradient-to-b from-transparent via-gray-800 to-transparent md:block hidden"></div>
                     
                     {msg.magiData ? (
-                      <div className="space-y-10 relative z-10">
+                      <div className="relative z-10 flex flex-col gap-10">
                         
                         {/* 1. Analysis */}
-                        <div className="bg-black border border-magi-dim/40 p-5 max-w-4xl mx-auto backdrop-blur-md text-center shadow-lg">
+                        <div className="order-5 bg-black border border-magi-dim/40 p-5 max-w-4xl mx-auto backdrop-blur-md text-center shadow-lg">
                            <div className="flex items-center justify-center gap-2 mb-3">
                               <span className="w-1 h-1 bg-magi-casper"></span>
-                              <span className="text-[10px] text-magi-casper tracking-[0.3em] uppercase font-bold">Context Analysis</span>
+                              <span className="text-[10px] text-magi-casper tracking-[0.3em] uppercase font-bold">Council Diagnostics</span>
                               <span className="w-1 h-1 bg-magi-casper"></span>
                            </div>
                            <p className="text-gray-300 text-sm md:text-base italic font-serif leading-relaxed">"{msg.magiData.centralAnalysis}"</p>
@@ -835,22 +835,22 @@ const App: React.FC = () => {
                         </div>
 
                         {/* 2. Nodes */}
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-8">
+                        <div className="order-6 grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-8">
                            <MagiNode systemType={MagiSystem.MELCHIOR} data={msg.magiData.melchior} isLoading={false} />
                            <MagiNode systemType={MagiSystem.BALTHASAR} data={msg.magiData.balthasar} isLoading={false} />
                            <MagiNode systemType={MagiSystem.CASPER} data={msg.magiData.casper} isLoading={false} />
                         </div>
 
                         {msg.magiData.meeting && msg.magiData.meeting.length > 0 && (
-                          <div className="max-w-6xl mx-auto border border-magi-dim/30 bg-black/70 p-5">
-                            <div className="text-[10px] text-magi-balthasar tracking-[0.3em] uppercase font-bold mb-4">Council Meeting</div>
+                          <div className="order-7 max-w-6xl mx-auto border border-magi-dim/30 bg-black/70 p-5">
+                            <div className="text-[10px] text-magi-balthasar tracking-[0.3em] uppercase font-bold mb-4">Council Transcript</div>
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                               {msg.magiData.meeting.map(exchange => (
                                 <div key={exchange.id} className="border border-gray-800 bg-[#0c0c0c] p-4 min-h-[180px]">
                                   <div className="flex items-center justify-between gap-3 mb-3">
                                     <div className="text-xs text-white font-bold tracking-widest">{exchange.speaker}</div>
                                     <div className={`text-[10px] font-bold ${exchange.revisedVote ? 'text-green-400' : 'text-red-400'}`}>
-                                      {exchange.revisedVote ? 'APPROVE' : 'REJECT'}
+                                      {exchange.revisedVote ? 'VOTE YES' : 'VOTE NO'}
                                     </div>
                                   </div>
                                   <p className="text-xs md:text-sm text-gray-300 leading-relaxed whitespace-pre-wrap">{exchange.content}</p>
@@ -867,7 +867,7 @@ const App: React.FC = () => {
                         )}
 
                         {msg.magiData.pendingActions && msg.magiData.pendingActions.length > 0 && (
-                          <div className="max-w-6xl mx-auto border border-magi-balthasar/50 bg-yellow-950/10 p-5">
+                          <div className="order-2 max-w-6xl mx-auto border border-magi-balthasar/50 bg-yellow-950/10 p-5">
                             <div className="flex items-center justify-between gap-3 mb-4">
                               <div className="text-[10px] text-magi-balthasar tracking-[0.3em] uppercase font-bold">Action Approval Queue</div>
                               <div className="text-[10px] text-magi-dim uppercase">{msg.magiData.pendingActions.filter(action => action.status === 'pending').length} pending</div>
@@ -917,7 +917,7 @@ const App: React.FC = () => {
                         )}
 
                         {msg.magiData.clarificationRequests && msg.magiData.clarificationRequests.length > 0 && (
-                          <div className="max-w-6xl mx-auto border border-magi-casper/50 bg-blue-950/10 p-5">
+                          <div className="order-3 max-w-6xl mx-auto border border-magi-casper/50 bg-blue-950/10 p-5">
                             <div className="text-[10px] text-magi-casper tracking-[0.3em] uppercase font-bold mb-4">Clarification Needed</div>
                             <div className="space-y-3">
                               {msg.magiData.clarificationRequests.map(request => (
@@ -939,7 +939,7 @@ const App: React.FC = () => {
                         )}
 
                         {msg.magiData.streamEvents && msg.magiData.streamEvents.length > 0 && (
-                          <div className="max-w-6xl mx-auto border border-magi-dim/30 bg-black/50 p-5">
+                          <div className="order-4 max-w-6xl mx-auto border border-magi-dim/30 bg-black/50 p-5">
                             <div className="text-[10px] text-magi-melchior tracking-[0.3em] uppercase font-bold mb-4">Execution Stream</div>
                             <div className="space-y-2 max-h-72 overflow-y-auto pr-2">
                               {msg.magiData.streamEvents.slice(-18).map(event => (
@@ -961,7 +961,7 @@ const App: React.FC = () => {
                         )}
 
                         {/* 3. Synthesis */}
-                        <div className="max-w-5xl mx-auto mt-8 pb-4">
+                        <div className="order-1 max-w-5xl mx-auto mt-8 pb-4">
                            <div className={`
                              relative border-l-4 p-6 md:p-10 overflow-hidden transition-all duration-1000 shadow-xl
                              ${isDecisionPositive(msg.magiData) ? 'border-white bg-[#111]' : msg.magiData.requiresUserInput ? 'border-magi-balthasar bg-yellow-950/10' : 'border-red-600 bg-red-950/20'}
@@ -1050,14 +1050,9 @@ const App: React.FC = () => {
 
             {/* Loading */}
             {status === 'THINKING' && (
-              <div className="max-w-7xl mx-auto pt-8 pb-12 opacity-80">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 animate-pulse">
-                  <MagiNode systemType={MagiSystem.MELCHIOR} isLoading={true} />
-                  <MagiNode systemType={MagiSystem.BALTHASAR} isLoading={true} />
-                  <MagiNode systemType={MagiSystem.CASPER} isLoading={true} />
-                </div>
+              <div className="max-w-7xl mx-auto pt-8 pb-12 opacity-80 space-y-6">
                 {liveStreamEvents.length > 0 && (
-                  <div className="mt-6 border border-magi-dim/30 bg-black/70 p-4 max-w-5xl mx-auto">
+                  <div className="border border-magi-dim/30 bg-black/70 p-4 max-w-5xl mx-auto">
                     <div className="text-[10px] text-magi-casper tracking-[0.3em] uppercase font-bold mb-3">Live Execution</div>
                     <div className="space-y-2 max-h-56 overflow-y-auto pr-2">
                       {liveStreamEvents.slice(-10).map(event => (
@@ -1078,7 +1073,7 @@ const App: React.FC = () => {
                   </div>
                 )}
                 {liveSynthesis && (
-                  <div className="mt-6 border border-magi-melchior/40 bg-black/80 p-5 max-w-5xl mx-auto">
+                  <div className="border border-magi-melchior/40 bg-black/80 p-5 max-w-5xl mx-auto">
                     <div className="text-[10px] text-magi-melchior tracking-[0.3em] uppercase font-bold mb-3">Live Synthesis</div>
                     <div className="text-sm md:text-base leading-relaxed text-gray-100 font-mono whitespace-pre-wrap">
                       {liveSynthesis}
@@ -1086,6 +1081,11 @@ const App: React.FC = () => {
                     </div>
                   </div>
                 )}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 animate-pulse">
+                  <MagiNode systemType={MagiSystem.MELCHIOR} isLoading={true} />
+                  <MagiNode systemType={MagiSystem.BALTHASAR} isLoading={true} />
+                  <MagiNode systemType={MagiSystem.CASPER} isLoading={true} />
+                </div>
               </div>
             )}
             

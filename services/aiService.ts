@@ -71,6 +71,14 @@ interface ToolRiskAssessment {
   summary: string;
 }
 
+interface ToolExecutionResult {
+  sources: GroundingSource[];
+  toolTraces: ToolTrace[];
+  pendingActions: PendingAction[];
+  streamEvents: StreamEvent[];
+  toolResultBlocks: string[];
+}
+
 interface RuntimeMcpTool {
   name: string;
   title?: string;
@@ -859,6 +867,95 @@ const formatLegacyMemories = (memories: MemoryItem[]) =>
     ? memories.map(memory => `[ID: ${memory.id}] ${memory.content}`).join('\n')
     : 'NO LEGACY CORTEX ITEMS.';
 
+const concreteActionPattern = /搜索|联网|查|查询|看一下|看看|读取|打开|浏览|截图|验证|测试|运行|执行|修改|改成|修|实现|search|browse|open|read|check|verify|test|run|execute|fix|implement|weather|天气/i;
+const genericClarificationPattern = /是否同意|是否批准|确认执行|要不要|希望先测试|哪方面能力|选择测试|which capability|what capability|do you want me to|should i proceed|approve.*search|confirm.*search/i;
+
+const isConcreteActionRequest = (userQuery: string) => concreteActionPattern.test(userQuery);
+
+const isReadOnlyToolTrace = (trace: ToolTrace) =>
+  trace.toolId === 'web.search.tavily' ||
+  /skill\.run/.test(trace.toolId) ||
+  /read|list|get|search|find|stat|describe|inspect|directory_tree|list_allowed|browser_navigate|browser_read_page|browser_screenshot|browser_close/i.test(trace.details || trace.summary || trace.toolId);
+
+const shouldKeepClarification = (
+  request: ClarificationRequest,
+  userQuery: string,
+  toolTraces: ToolTrace[],
+  pendingActions: PendingAction[],
+) => {
+  if (pendingActions.some(action => action.requiresApproval && action.status === 'pending')) return true;
+  if (!isConcreteActionRequest(userQuery)) return true;
+
+  const hasReadOnlyToolAttempt = toolTraces.some(trace =>
+    isReadOnlyToolTrace(trace) && (trace.status === 'allowed' || trace.status === 'failed' || trace.status === 'skipped'),
+  );
+  if (!hasReadOnlyToolAttempt) return true;
+
+  return !genericClarificationPattern.test(`${request.question}\n${request.reason || ''}`);
+};
+
+const shouldPersonaOwnToolRequest = (systemType: MagiSystem, request: PlannedToolRequest) => {
+  if (request.toolId === 'web.search.tavily') return systemType === MagiSystem.MELCHIOR;
+
+  if (request.toolId === 'mcp.call') {
+    const server = typeof request.arguments?.server === 'string' ? request.arguments.server : '';
+    const tool = typeof request.arguments?.tool === 'string' ? request.arguments.tool : '';
+    if (server === 'browser') return systemType === MagiSystem.CASPER;
+    if (server === 'filesystem' && /list_allowed/i.test(tool)) return systemType === MagiSystem.BALTHASAR;
+    if (server === 'filesystem') return systemType === MagiSystem.MELCHIOR;
+  }
+
+  return true;
+};
+
+const getToolRequestOwner = (request: PlannedToolRequest): MagiSystem => {
+  if (request.toolId === 'web.search.tavily') return MagiSystem.MELCHIOR;
+
+  if (request.toolId === 'skill.run') {
+    const skill = typeof request.arguments?.skill === 'string' ? request.arguments.skill.toLowerCase() : '';
+    if (/browser|visual|ui|verification/.test(skill)) return MagiSystem.CASPER;
+    if (/mcp|tool|permission|safety|audit/.test(skill)) return MagiSystem.BALTHASAR;
+    return MagiSystem.MELCHIOR;
+  }
+
+  if (request.toolId === 'mcp.call') {
+    const server = typeof request.arguments?.server === 'string' ? request.arguments.server : '';
+    const tool = typeof request.arguments?.tool === 'string' ? request.arguments.tool : '';
+    if (server === 'browser') return MagiSystem.CASPER;
+    if (server === 'filesystem' && /list_allowed/i.test(tool)) return MagiSystem.BALTHASAR;
+    if (server === 'filesystem') return MagiSystem.MELCHIOR;
+  }
+
+  return MagiSystem.MELCHIOR;
+};
+
+const toolRequestAlreadyAttempted = (request: PlannedToolRequest, traces: ToolTrace[]) => {
+  if (request.toolId === 'web.search.tavily') {
+    const query = typeof request.arguments?.query === 'string' ? request.arguments.query.trim() : '';
+    return Boolean(query) && traces.some(trace => trace.toolId === 'web.search.tavily' && trace.query === query);
+  }
+
+  if (request.toolId === 'skill.run') {
+    const skill = typeof request.arguments?.skill === 'string' ? request.arguments.skill.trim() : '';
+    return Boolean(skill) && traces.some(trace =>
+      trace.toolId === 'skill.run' &&
+      trace.details?.includes(`"skill": "${skill}"`),
+    );
+  }
+
+  if (request.toolId === 'mcp.call') {
+    const server = typeof request.arguments?.server === 'string' ? request.arguments.server : '';
+    const tool = typeof request.arguments?.tool === 'string' ? request.arguments.tool : '';
+    return Boolean(server && tool) && traces.some(trace =>
+      trace.toolId === 'mcp.call' &&
+      trace.details?.includes(`"server": "${server}"`) &&
+      trace.details?.includes(`"tool": "${tool}"`),
+    );
+  }
+
+  return false;
+};
+
 const buildPersonaHarness = (
   systemType: MagiSystem,
   documents: HarnessDocuments,
@@ -922,7 +1019,7 @@ const planPersonaTools = async (
   const config = systemConfigs[systemType];
 
   const prompt = `
-You are ${config.name}. Decide whether any permitted tools are useful before your main analysis.
+You are ${config.name}. Decide whether any permitted tools are useful at this first action opportunity before your main analysis.
 
 ${harnessBlock}
 
@@ -935,6 +1032,8 @@ Request only tools that are directly useful and permissioned by the registry. Pr
 
 Important:
 - The Authoritative Runtime Tool Manifest is live. Trust it over stale memory.
+- Action is available throughout the whole run: analysis, council, synthesis, and approved execution. This is only the first chance to act.
+- When a low-risk tool can answer or verify the task, request it now instead of proposing that the user approve a future test.
 - If the user asks about local code, files, repo structure, or whether MAGI can access the project, use filesystem MCP when it is listed.
 - Do not answer "browser sandbox cannot access filesystem" when bridge is online and filesystem MCP tools are listed. Request mcp.call instead.
 - If the user asks for skill details and a matching runtime skill is listed, request skill.run with mode "load".
@@ -1006,44 +1105,20 @@ User query: "${userQuery}"
   }
 };
 
-const queryArchetype = async (
+const executeToolRequests = async (
+  requests: PlannedToolRequest[],
   systemType: MagiSystem,
-  userQuery: string,
-  contextStr: string,
-  legacyMemoryStr: string,
-  language: Language,
   harness: MagiHarnessContext,
-  runtime: RuntimeCapabilities,
-  runtimeBlock: string,
   onEvent?: QueryMagiOptions['onEvent'],
-): Promise<PersonaQueryResult> => {
+): Promise<ToolExecutionResult> => {
   const config = systemConfigs[systemType];
-  const client = createClient(harness.settings);
-  const modelName = getModelName(harness.settings);
-  const harnessBlock = buildPersonaHarness(systemType, harness.documents, legacyMemoryStr, runtimeBlock);
-  const allowedDocumentIds = new Set<HarnessDocumentId>([
-    getPersonaMemoryDocumentId(systemType),
-    'memory.shared',
-  ]);
-
-  let toolContext = 'NO EXTERNAL TOOLS USED.';
-  let sources: GroundingSource[] = [];
+  const sources: GroundingSource[] = [];
   const toolTraces: ToolTrace[] = [];
-  const toolResultBlocks: string[] = [];
   const pendingActions: PendingAction[] = [];
   const streamEvents: StreamEvent[] = [];
-  emitStreamEvent(streamEvents, onEvent, 'tool-plan', config.name, 'running', 'Planning permitted tool usage.');
-  const toolRequests = await planPersonaTools(client, modelName, harness.settings, systemType, harnessBlock, userQuery, runtime);
-  emitStreamEvent(
-    streamEvents,
-    onEvent,
-    'tool-plan',
-    config.name,
-    'complete',
-    `${toolRequests.length} tool request${toolRequests.length === 1 ? '' : 's'} proposed.`,
-  );
+  const toolResultBlocks: string[] = [];
 
-  for (const request of toolRequests) {
+  for (const request of requests.filter(request => shouldPersonaOwnToolRequest(systemType, request))) {
     const allowed = hasToolPermission(harness.documents, systemType, request.toolId);
     if (!allowed) {
       toolTraces.push({
@@ -1097,7 +1172,7 @@ const queryArchetype = async (
 
       emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'running', `Searching web: ${query}`);
       const searchResult = await searchTavily(query, harness.settings);
-      sources = [...sources, ...searchResult.sources];
+      sources.push(...searchResult.sources);
       const searchContext = searchResult.results.length > 0
         ? searchResult.results.map(result => `[Source: ${result.title}] ${result.content}`).join('\n\n')
         : 'WEB SEARCH RETURNED NO RESULTS.';
@@ -1123,7 +1198,10 @@ const queryArchetype = async (
     try {
       emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'running', `Executing ${request.toolId}.`);
       const bridgeResult = await executeBridgeTool(request.toolId, request.arguments || {}, config.name);
-      const details = truncateForPrompt(bridgeResult.result);
+      const details = truncateForPrompt({
+        request: request.arguments || {},
+        result: bridgeResult.result,
+      });
       toolResultBlocks.push(`### ${config.name} used ${request.toolId}\nReason: ${request.reason || 'No reason supplied.'}\nResult:\n${details}`);
       toolTraces.push({
         systemName: config.name,
@@ -1144,6 +1222,61 @@ const queryArchetype = async (
       emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'failed', `${request.toolId} failed.`, error instanceof Error ? error.message : 'Bridge tool failed.');
     }
   }
+
+  return {
+    sources,
+    toolTraces,
+    pendingActions,
+    streamEvents,
+    toolResultBlocks,
+  };
+};
+
+const queryArchetype = async (
+  systemType: MagiSystem,
+  userQuery: string,
+  contextStr: string,
+  legacyMemoryStr: string,
+  language: Language,
+  harness: MagiHarnessContext,
+  runtime: RuntimeCapabilities,
+  runtimeBlock: string,
+  onEvent?: QueryMagiOptions['onEvent'],
+): Promise<PersonaQueryResult> => {
+  const config = systemConfigs[systemType];
+  const client = createClient(harness.settings);
+  const modelName = getModelName(harness.settings);
+  const harnessBlock = buildPersonaHarness(systemType, harness.documents, legacyMemoryStr, runtimeBlock);
+  const allowedDocumentIds = new Set<HarnessDocumentId>([
+    getPersonaMemoryDocumentId(systemType),
+    'memory.shared',
+  ]);
+
+  let toolContext = 'NO EXTERNAL TOOLS USED.';
+  let sources: GroundingSource[] = [];
+  const toolTraces: ToolTrace[] = [];
+  const toolResultBlocks: string[] = [];
+  const pendingActions: PendingAction[] = [];
+  const streamEvents: StreamEvent[] = [];
+  emitStreamEvent(streamEvents, onEvent, 'tool-plan', config.name, 'running', 'Planning permitted tool usage.');
+  const toolRequests = await planPersonaTools(client, modelName, harness.settings, systemType, harnessBlock, userQuery, runtime);
+  emitStreamEvent(
+    streamEvents,
+    onEvent,
+    'tool-plan',
+    config.name,
+    'complete',
+    `${toolRequests.length} tool request${toolRequests.length === 1 ? '' : 's'} proposed.`,
+  );
+
+  const execution = await executeToolRequests(toolRequests, systemType, harness, event => {
+    streamEvents.push(event);
+    onEvent?.(event);
+  });
+  sources = [...sources, ...execution.sources];
+  toolTraces.push(...execution.toolTraces);
+  pendingActions.push(...execution.pendingActions);
+  toolResultBlocks.push(...execution.toolResultBlocks);
 
   if (toolResultBlocks.length > 0) {
     toolContext = toolResultBlocks.join('\n\n');
@@ -1260,6 +1393,197 @@ const makeTraceStep = (
   details,
 });
 
+const planCouncilTools = async (
+  systemType: MagiSystem,
+  userQuery: string,
+  language: Language,
+  harness: MagiHarnessContext,
+  runtime: RuntimeCapabilities,
+  runtimeBlock: string,
+  initialOutputs: Record<MagiSystem, MagiAnalysis>,
+  existingToolTraces: ToolTrace[],
+  pendingActions: PendingAction[],
+): Promise<PlannedToolRequest[]> => {
+  const config = systemConfigs[systemType];
+  const client = createClient(harness.settings);
+  const modelName = getModelName(harness.settings);
+  const langInstruction = language === 'CN'
+    ? 'Think in Chinese and return JSON only.'
+    : 'Think in English and return JSON only.';
+  const ownOutput = initialOutputs[systemType];
+  const toolAudit = existingToolTraces.map(trace =>
+    `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 800)}`,
+  ).join('\n') || 'NO TOOL CALLS YET.';
+
+  const promptText = `
+You are ${config.name}. The council is allowed to act while deliberating. Decide whether you need another permitted tool call before the meeting statement.
+
+${langInstruction}
+
+${runtimeBlock}
+
+## User Query
+${userQuery}
+
+## Your Initial Output
+Analysis: ${ownOutput.analysis}
+Proposal: ${ownOutput.proposal}
+Vote: ${ownOutput.vote ? 'APPROVE' : 'REJECT'}
+
+## Existing Tool Audit
+${toolAudit}
+
+## Pending Actions
+${formatPendingActions(pendingActions)}
+
+Rules:
+- Do not ask the user for permission to run low-risk read-only tools; request the tool now.
+- If a factual claim can be checked with an available read-only tool, request it.
+- Avoid repeating a tool call that already has a useful result in Tool Audit.
+- Risky click/type/write actions may be requested, but they will enter the approval queue.
+- Return no requests when no additional action is useful.
+
+Return JSON only:
+{
+  "requests": [
+    { "toolId": "web.search.tavily | skill.run | mcp.call", "arguments": {}, "reason": "brief reason" }
+  ]
+}
+`;
+
+  try {
+    const response = await client.chat.completions.create(createChatParams(harness.settings, {
+      model: modelName,
+      messages: [{ role: 'system', content: promptText }],
+      temperature: 0.2,
+      max_tokens: 300,
+      response_format: { type: 'json_object' },
+    }) as any);
+    const text = response.choices[0]?.message?.content;
+    if (!text) return [];
+    const parsed = safeParse(text, `${config.name} COUNCIL TOOL PLANNER`) as { requests?: unknown };
+    if (!Array.isArray(parsed.requests)) return [];
+
+    return parsed.requests
+      .filter((request): request is PlannedToolRequest => {
+        if (!request || typeof request !== 'object') return false;
+        const candidate = request as PlannedToolRequest;
+        return candidate.toolId === 'web.search.tavily' ||
+          candidate.toolId === 'skill.run' ||
+          candidate.toolId === 'mcp.call';
+      })
+      .map(request => ({
+        toolId: request.toolId,
+        arguments: request.arguments && typeof request.arguments === 'object' && !Array.isArray(request.arguments)
+          ? request.arguments
+          : {},
+        reason: typeof request.reason === 'string' ? request.reason : '',
+      }))
+      .filter(request => shouldPersonaOwnToolRequest(systemType, request))
+      .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces))
+      .slice(0, 1);
+  } catch (error) {
+    console.warn(`[${config.name}] Council tool-planning step failed.`, error);
+    return [];
+  }
+};
+
+const planSynthesisTools = async (
+  userQuery: string,
+  language: Language,
+  harness: MagiHarnessContext,
+  runtimeBlock: string,
+  initialOutputs: Record<MagiSystem, MagiAnalysis>,
+  meeting: CouncilExchange[],
+  existingToolTraces: ToolTrace[],
+  pendingActions: PendingAction[],
+): Promise<PlannedToolRequest[]> => {
+  const client = createClient(harness.settings);
+  const modelName = getModelName(harness.settings);
+  const langInstruction = language === 'CN'
+    ? 'Think in Chinese and return JSON only.'
+    : 'Think in English and return JSON only.';
+  const personaBrief = Object.values(MagiSystem).map(systemType => {
+    const output = initialOutputs[systemType];
+    return `[${output.systemName}]\nAnalysis: ${output.analysis}\nProposal: ${output.proposal}\nVote: ${output.vote ? 'APPROVE' : 'REJECT'}`;
+  }).join('\n\n');
+  const toolAudit = existingToolTraces.map(trace =>
+    `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 900)}`,
+  ).join('\n') || 'NO TOOL CALLS YET.';
+
+  const promptText = `
+You are the MAGI council integrator immediately before final synthesis. The council has already discussed, but discussion is not a substitute for action.
+
+${langInstruction}
+
+${runtimeBlock}
+
+## User Query
+${userQuery}
+
+## Persona Outputs
+${personaBrief}
+
+## Council Meeting Transcript
+${formatMeetingTranscript(meeting)}
+
+## Existing Tool Audit
+${toolAudit}
+
+## Pending Actions
+${formatPendingActions(pendingActions)}
+
+Rules:
+- This is the final pre-answer action checkpoint. If a permitted tool can settle a remaining factual, file, browser, skill, or MCP uncertainty, request it now.
+- Do not ask the user for permission to run low-risk read-only tools. Use them.
+- Avoid repeating useful tool calls already present in Tool Audit.
+- Risky click/type/write/execute actions may be requested, but they will become pending approvals.
+- Return no requests when the answer can already be grounded in existing tool results.
+
+Return JSON only:
+{
+  "requests": [
+    { "toolId": "web.search.tavily | skill.run | mcp.call", "arguments": {}, "reason": "brief reason" }
+  ]
+}
+`;
+
+  try {
+    const response = await client.chat.completions.create(createChatParams(harness.settings, {
+      model: modelName,
+      messages: [{ role: 'system', content: promptText }],
+      temperature: 0.2,
+      max_tokens: 420,
+      response_format: { type: 'json_object' },
+    }) as any);
+    const text = response.choices[0]?.message?.content;
+    if (!text) return [];
+    const parsed = safeParse(text, 'SYNTHESIS TOOL PLANNER') as { requests?: unknown };
+    if (!Array.isArray(parsed.requests)) return [];
+
+    return parsed.requests
+      .filter((request): request is PlannedToolRequest => {
+        if (!request || typeof request !== 'object') return false;
+        const candidate = request as PlannedToolRequest;
+        return candidate.toolId === 'web.search.tavily' ||
+          candidate.toolId === 'skill.run' ||
+          candidate.toolId === 'mcp.call';
+      })
+      .map(request => ({
+        toolId: request.toolId,
+        arguments: request.arguments && typeof request.arguments === 'object' && !Array.isArray(request.arguments)
+          ? request.arguments
+          : {},
+        reason: typeof request.reason === 'string' ? request.reason : '',
+      }))
+      .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces))
+      .slice(0, 2);
+  } catch (error) {
+    console.warn('[COUNCIL] Synthesis tool-planning step failed.', error);
+    return [];
+  }
+};
+
 const queryCouncilExchange = async (
   systemType: MagiSystem,
   prompt: string,
@@ -1268,6 +1592,7 @@ const queryCouncilExchange = async (
   contextStr: string,
   initialOutputs: Record<MagiSystem, MagiAnalysis>,
   pendingActions: PendingAction[],
+  toolAudit: ToolTrace[],
   runtimeBlock: string,
   onEvent?: QueryMagiOptions['onEvent'],
 ): Promise<{ exchange: CouncilExchange; clarifications: ClarificationRequest[]; events: StreamEvent[] }> => {
@@ -1318,8 +1643,11 @@ ${otherOutputs}
 ## Pending Action Queue
 ${formatPendingActions(pendingActions)}
 
-Respond to the other two personas. Challenge weak assumptions, name blocked actions, and revise your proposal if needed.
-If the council cannot safely proceed without the user, ask one or two concrete clarification questions.
+## Tool Audit So Far
+${toolAudit.map(trace => `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 900)}`).join('\n') || 'NO TOOL CALLS.'}
+
+Respond to the other two personas and the tool results. Challenge weak assumptions, name blocked actions, and revise your proposal if needed.
+Do not ask the user to approve low-risk read-only work that already executed or could have executed. Ask clarification only for genuinely missing intent, credentials, destructive changes, or pending approval.
 
 Return JSON only:
 {
@@ -1440,8 +1768,9 @@ ${formatPendingActions(pendingActions)}
 
 Rules:
 - Be concise and concrete.
+- Lead with the answer or completed action result, not the council process.
 - If pending actions require approval, clearly say they are waiting and do not claim they have executed.
-- If user input is required, ask the focused question(s) implied by the draft.
+- If user input is required, ask the focused question(s) implied by the draft; do not ask for confirmation to run low-risk tools that already ran.
 - Preserve the substance of the structured council result.
 `;
 
@@ -1587,19 +1916,19 @@ export const queryMagiSystem = async (
     ));
   });
 
-  const allSources = dedupeSources([
+  let allSources = dedupeSources([
     ...melchior.groundingSources,
     ...balthasar.groundingSources,
     ...casper.groundingSources,
   ]);
 
-  const pendingActions = [
+  let pendingActions = [
     ...melchior.pendingActions,
     ...balthasar.pendingActions,
     ...casper.pendingActions,
   ];
 
-  const allToolTraces = [
+  let allToolTraces = [
     ...(melchior.toolTraces || []),
     ...(balthasar.toolTraces || []),
     ...(casper.toolTraces || []),
@@ -1627,17 +1956,69 @@ export const queryMagiSystem = async (
     [MagiSystem.CASPER]: casper,
   };
 
+  emit('council-tools', 'COUNCIL', 'running', 'Checking whether deliberation needs more tool action.');
+  const councilToolPlans = await Promise.all(Object.values(MagiSystem).map(async systemType => ({
+    systemType,
+    requests: await planCouncilTools(
+      systemType,
+      prompt,
+      language,
+      harness,
+      runtime,
+      runtimeBlock,
+      initialOutputs,
+      allToolTraces,
+      pendingActions,
+    ),
+  })));
+
+  const councilToolExecutions = await Promise.all(councilToolPlans.map(async plan => ({
+    systemType: plan.systemType,
+    result: await executeToolRequests(plan.requests, plan.systemType, harness, event => {
+      streamEvents.push(event);
+      options.onEvent?.(event);
+    }),
+  })));
+
+  const councilToolCount = councilToolExecutions.reduce((sum, item) => sum + item.result.toolTraces.length, 0);
+  councilToolExecutions.forEach(item => {
+    allSources = dedupeSources([...allSources, ...item.result.sources]);
+    pendingActions = [...pendingActions, ...item.result.pendingActions];
+    allToolTraces = [...allToolTraces, ...item.result.toolTraces];
+    item.result.toolTraces.forEach(toolTrace => {
+      trace.push(makeTraceStep(
+        'council-tool',
+        toolTrace.systemName,
+        toolTrace.status === 'failed'
+          ? 'failed'
+          : toolTrace.status === 'skipped'
+            ? 'skipped'
+            : toolTrace.status === 'pending'
+              ? 'waiting'
+              : 'complete',
+        `${toolTrace.toolId}: ${toolTrace.status}`,
+        toolTrace.details || toolTrace.query || toolTrace.summary,
+      ));
+    });
+  });
+  emit(
+    'council-tools',
+    'COUNCIL',
+    'complete',
+    councilToolCount > 0 ? `${councilToolCount} council-stage tool action(s) processed.` : 'No additional council-stage tool action needed.',
+  );
+
   emit('meeting', 'COUNCIL', 'running', 'Starting three-persona council round.');
   const meetingResults = await Promise.all([
-    queryCouncilExchange(MagiSystem.MELCHIOR, prompt, language, harness, contextStr, initialOutputs, pendingActions, runtimeBlock, event => {
+    queryCouncilExchange(MagiSystem.MELCHIOR, prompt, language, harness, contextStr, initialOutputs, pendingActions, allToolTraces, runtimeBlock, event => {
       streamEvents.push(event);
       options.onEvent?.(event);
     }),
-    queryCouncilExchange(MagiSystem.BALTHASAR, prompt, language, harness, contextStr, initialOutputs, pendingActions, runtimeBlock, event => {
+    queryCouncilExchange(MagiSystem.BALTHASAR, prompt, language, harness, contextStr, initialOutputs, pendingActions, allToolTraces, runtimeBlock, event => {
       streamEvents.push(event);
       options.onEvent?.(event);
     }),
-    queryCouncilExchange(MagiSystem.CASPER, prompt, language, harness, contextStr, initialOutputs, pendingActions, runtimeBlock, event => {
+    queryCouncilExchange(MagiSystem.CASPER, prompt, language, harness, contextStr, initialOutputs, pendingActions, allToolTraces, runtimeBlock, event => {
       streamEvents.push(event);
       options.onEvent?.(event);
     }),
@@ -1656,6 +2037,55 @@ export const queryMagiSystem = async (
       exchange.content,
     ));
   });
+
+  emit('synthesis-tools', 'COUNCIL', 'running', 'Checking whether final synthesis needs more tool action.');
+  const synthesisToolRequests = await planSynthesisTools(
+    prompt,
+    language,
+    harness,
+    runtimeBlock,
+    initialOutputs,
+    meeting,
+    allToolTraces,
+    pendingActions,
+  );
+  const synthesisToolExecutions = await Promise.all(synthesisToolRequests.map(async request => {
+    const owner = getToolRequestOwner(request);
+    return {
+      owner,
+      result: await executeToolRequests([request], owner, harness, event => {
+        streamEvents.push(event);
+        options.onEvent?.(event);
+      }),
+    };
+  }));
+  const synthesisToolCount = synthesisToolExecutions.reduce((sum, item) => sum + item.result.toolTraces.length, 0);
+  synthesisToolExecutions.forEach(item => {
+    allSources = dedupeSources([...allSources, ...item.result.sources]);
+    pendingActions = [...pendingActions, ...item.result.pendingActions];
+    allToolTraces = [...allToolTraces, ...item.result.toolTraces];
+    item.result.toolTraces.forEach(toolTrace => {
+      trace.push(makeTraceStep(
+        'synthesis-tool',
+        toolTrace.systemName,
+        toolTrace.status === 'failed'
+          ? 'failed'
+          : toolTrace.status === 'skipped'
+            ? 'skipped'
+            : toolTrace.status === 'pending'
+              ? 'waiting'
+              : 'complete',
+        `${toolTrace.toolId}: ${toolTrace.status}`,
+        toolTrace.details || toolTrace.query || toolTrace.summary,
+      ));
+    });
+  });
+  emit(
+    'synthesis-tools',
+    'COUNCIL',
+    'complete',
+    synthesisToolCount > 0 ? `${synthesisToolCount} synthesis-stage tool action(s) processed.` : 'No final tool action needed before synthesis.',
+  );
 
   const synthesisAllowedDocs = new Set<HarnessDocumentId>([
     'memory.shared',
@@ -1735,7 +2165,8 @@ Return JSON only:
 }
 
 If the pending action queue is not empty, do not claim those actions have executed. Ask for approval in clarificationRequests when approval is required.
-If the next safe step depends on missing user intent, set requiresUserInput true and ask focused questions.
+If low-risk read-only tools have already run, answer from their results instead of asking whether to run them.
+If the next safe step depends on genuinely missing user intent, credentials, destructive changes, or a risky action approval, set requiresUserInput true and ask focused questions.
 If runtime bridge is online and filesystem MCP tools are listed, do not say the system cannot inspect local files. Instead summarize tool results or state which mcp.call should be approved/executed next.
 `;
 
@@ -1780,7 +2211,9 @@ If runtime bridge is online and filesystem MCP tools are listed, do not say the 
   const clarificationRequests = [
     ...personaClarifications,
     ...normalizeClarificationRequests(synthesisResult.clarificationRequests, 'Council synthesis needs confirmation.'),
-  ].slice(0, 6);
+  ]
+    .filter(request => shouldKeepClarification(request, prompt, allToolTraces, pendingActions))
+    .slice(0, 6);
 
   const requiresUserInput = Boolean(synthesisResult.requiresUserInput) ||
     pendingActions.some(action => action.requiresApproval && action.status === 'pending') ||
