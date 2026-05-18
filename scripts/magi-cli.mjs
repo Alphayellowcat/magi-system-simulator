@@ -8,8 +8,19 @@ process.env.NODE_NO_WARNINGS = process.env.NODE_NO_WARNINGS || '1';
 process.noDeprecation = true;
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const COMMANDS = new Set(['run', 'smoke', 'status', 'help']);
+const COMMANDS = new Set(['run', 'smoke', 'status', 'matrix', 'help']);
 const DEFAULT_SMOKE_PROMPT = '请通过 filesystem MCP 读取当前项目根目录列表，判断 MAGI 是否能看到本体代码。若看到 App.tsx 或 package.json，最终回答第一行必须原样写出 MAGI_CAN_SEE_CODE_YES，并给出证据。';
+const PERSONA_ALIASES = {
+  melchior: 'MELCHIOR-1',
+  'melchior-1': 'MELCHIOR-1',
+  m: 'MELCHIOR-1',
+  balthasar: 'BALTHASAR-2',
+  'balthasar-2': 'BALTHASAR-2',
+  b: 'BALTHASAR-2',
+  casper: 'CASPER-3',
+  'casper-3': 'CASPER-3',
+  c: 'CASPER-3',
+};
 
 const usage = () => `MAGI CLI verification flywheel
 
@@ -17,12 +28,15 @@ Usage:
   npm run magi:cli -- "prompt"
   npm run magi:cli -- --prompt "prompt" --expect-tool mcp.call
   npm run magi:status
+  npm run magi:matrix
+  npm run magi:matrix -- --set CASPER-3:mcp.browser.read=allow
   npm run magi:smoke
   npm run magi:smoke:full
 
 Commands:
   run       Run one real MAGI council turn from the CLI.
   status    Start the local bridge and list runtime skills/MCP tools.
+  matrix    View or update the Tool Access Matrix saved in .magi/state/settings.json.
   smoke     Run deterministic bridge checks; add --full or use magi:smoke:full for a real MAGI prompt.
 
 Useful flags:
@@ -40,6 +54,10 @@ Useful flags:
   --expect-no-offline       Assert that no persona fell back to NODE OFFLINE.
   --expect-no-failed-events Assert that no stream events have status=failed.
   --expect-pending          Assert that at least one action is pending approval.
+  --set <persona:key=mode>  Matrix command: set one cell. Mode: allow, review/ask, deny.
+  --persona <id>            Matrix command: persona for --tool/--mode.
+  --tool <key>              Matrix command: tool access key for --persona/--mode.
+  --mode <mode>             Matrix command: allow, review/ask, or deny.
   --bridge-only             Smoke command: skip the real LLM prompt.
   --full                    Smoke command: include the real LLM prompt.
   --quiet                   Suppress live progress in text mode.
@@ -72,6 +90,10 @@ const parseArgs = argv => {
     expectNoOffline: false,
     expectNoFailedEvents: false,
     expectPending: false,
+    matrixSets: [],
+    matrixPersona: '',
+    matrixTool: '',
+    matrixMode: '',
   };
 
   const positionals = [];
@@ -110,11 +132,22 @@ const parseArgs = argv => {
     else if (token === '--expect-no-offline') args.expectNoOffline = true;
     else if (token === '--expect-no-failed-events') args.expectNoFailedEvents = true;
     else if (token === '--expect-pending') args.expectPending = true;
+    else if (token === '--set') args.matrixSets.push(next());
+    else if (token === '--persona') args.matrixPersona = next();
+    else if (token === '--tool') args.matrixTool = next();
+    else if (token === '--mode') args.matrixMode = next();
+    else if (args.command !== 'run' && ['text', 'json', 'jsonl'].includes(token)) args.format = token;
     else if (token.startsWith('--')) throw new Error(`Unknown flag: ${token}`);
     else positionals.push(token);
   }
 
-  if (!args.prompt && positionals.length > 0) {
+  if (args.command === 'matrix') {
+    positionals.forEach(item => {
+      if (/^[^:]+:[^=]+=(allow|review|ask|deny)$/i.test(item)) {
+        args.matrixSets.push(item);
+      }
+    });
+  } else if (!args.prompt && positionals.length > 0) {
     args.prompt = positionals.join(' ');
   }
 
@@ -208,15 +241,13 @@ const loadRuntimeModules = async server => {
 const loadHarness = async (root, harnessService) => {
   const stateDir = path.join(root, '.magi', 'state');
   const savedSettings = await readJsonIfExists(path.join(stateDir, 'settings.json'), null);
-  const settings = {
-    ...harnessService.createDefaultHarnessSettings(),
-    ...(savedSettings || {}),
-  };
+  let settings = harnessService.normalizeHarnessSettings(savedSettings);
 
   if (!settings.apiKey && process.env.OPENAI_API_KEY) settings.apiKey = process.env.OPENAI_API_KEY;
   if (!settings.baseURL && process.env.OPENAI_BASE_URL) settings.baseURL = process.env.OPENAI_BASE_URL;
   if (!settings.modelName && process.env.OPENAI_MODEL_NAME) settings.modelName = process.env.OPENAI_MODEL_NAME;
   if (!settings.tavilyApiKey && process.env.VITE_TAVILY_API_KEY) settings.tavilyApiKey = process.env.VITE_TAVILY_API_KEY;
+  settings = harnessService.normalizeHarnessSettings(settings);
 
   const savedDocuments = await readJsonIfExists(path.join(stateDir, 'documents.json'), null);
   let documents;
@@ -243,6 +274,7 @@ const loadHarness = async (root, harnessService) => {
 
   return {
     settings,
+    savedSettings: savedSettings || null,
     documents,
     memories: Array.isArray(memories) ? memories : [],
     sessions: Array.isArray(sessions) ? sessions : [],
@@ -496,6 +528,96 @@ const runStatus = async ctx => {
   return { status, mcpTools };
 };
 
+const normalizePersona = value => {
+  const normalized = String(value || '').trim();
+  if (!normalized) throw new Error('Persona is required.');
+  const alias = PERSONA_ALIASES[normalized.toLowerCase()];
+  return alias || normalized.toUpperCase();
+};
+
+const normalizeMatrixMode = value => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'ask') return 'review';
+  if (['allow', 'review', 'deny'].includes(normalized)) return normalized;
+  throw new Error(`Unsupported matrix mode: ${value}`);
+};
+
+const parseMatrixSet = value => {
+  const match = String(value || '').match(/^([^:]+):([^=]+)=(allow|review|ask|deny)$/i);
+  if (!match) {
+    throw new Error(`Invalid --set value: ${value}. Use PERSONA:tool.access.key=allow|review|deny`);
+  }
+  return {
+    persona: normalizePersona(match[1]),
+    key: match[2].trim(),
+    mode: normalizeMatrixMode(match[3]),
+  };
+};
+
+const formatMatrixRow = (label, values) =>
+  `${label.padEnd(23)} ${values.map(value => value.toUpperCase().padEnd(8)).join(' ')}`;
+
+const printMatrix = (payload) => {
+  const personas = payload.personas;
+  process.stdout.write('MAGI Tool Access Matrix\n');
+  process.stdout.write(`Saved settings: ${payload.saved ? 'yes' : 'no'}\n`);
+  process.stdout.write(`${''.padEnd(23)} ${personas.map(persona => persona.padEnd(8)).join(' ')}\n`);
+  payload.definitions.forEach(definition => {
+    process.stdout.write(formatMatrixRow(definition.key, personas.map(persona => payload.matrix[persona][definition.key])) + '\n');
+  });
+};
+
+const runMatrixCommand = async (ctx, args) => {
+  const definitions = ctx.modules.harnessService.TOOL_ACCESS_DEFINITIONS;
+  const validKeys = new Set(definitions.map(definition => definition.key));
+  const personas = Object.keys(ctx.modules.harnessService.normalizeToolAccessMatrix(ctx.harness.settings.toolAccess));
+  const personaSet = new Set(personas);
+  const edits = args.matrixSets.map(parseMatrixSet);
+
+  if (args.matrixPersona || args.matrixTool || args.matrixMode) {
+    if (!args.matrixPersona || !args.matrixTool || !args.matrixMode) {
+      throw new Error('--persona, --tool, and --mode must be provided together.');
+    }
+    edits.push({
+      persona: normalizePersona(args.matrixPersona),
+      key: args.matrixTool.trim(),
+      mode: normalizeMatrixMode(args.matrixMode),
+    });
+  }
+
+  const matrix = ctx.modules.harnessService.normalizeToolAccessMatrix(ctx.harness.settings.toolAccess);
+  edits.forEach(edit => {
+    if (!personaSet.has(edit.persona)) throw new Error(`Unknown persona: ${edit.persona}`);
+    if (!validKeys.has(edit.key)) throw new Error(`Unknown tool access key: ${edit.key}`);
+    matrix[edit.persona][edit.key] = edit.mode;
+  });
+
+  let saved = false;
+  if (edits.length > 0) {
+    const diskSettings = ctx.modules.harnessService.normalizeHarnessSettings(ctx.harness.savedSettings || {});
+    const settingsForDisk = ctx.modules.harnessService.normalizeHarnessSettings({
+      ...diskSettings,
+      toolAccess: matrix,
+    });
+    await writeJsonFile(path.join(ROOT, '.magi', 'state', 'settings.json'), settingsForDisk);
+    ctx.harness.savedSettings = settingsForDisk;
+    ctx.harness.settings = ctx.modules.harnessService.normalizeHarnessSettings({
+      ...ctx.harness.settings,
+      toolAccess: matrix,
+    });
+    saved = true;
+  }
+
+  return {
+    type: 'tool-access-matrix',
+    saved,
+    edits,
+    personas,
+    definitions,
+    matrix,
+  };
+};
+
 const runBridgeSmoke = async ctx => {
   const { status, mcpTools } = await runStatus(ctx);
   const checks = [
@@ -569,6 +691,13 @@ const main = async () => {
       const payload = await runStatus(ctx);
       if (args.format === 'json') process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
       else printStatus(payload);
+      return;
+    }
+
+    if (args.command === 'matrix') {
+      const payload = await runMatrixCommand(ctx, args);
+      if (args.format === 'json') process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+      else printMatrix(payload);
       return;
     }
 

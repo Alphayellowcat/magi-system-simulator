@@ -1,0 +1,130 @@
+{
+  "actions": [
+    {
+      "id": "quote.current",
+      "description": "Fetch a current or recent quote for a normalized stock or crypto symbol.",
+      "toolId": "skill.run",
+      "mode": "script",
+      "script": "scripts/quote_multi_provider.ps1",
+      "args": [
+        { "from": "extracted_symbol" },
+        { "value": "--pretty" }
+      ],
+      "triggers": [
+        "股价",
+        "股票行情",
+        "实时报价",
+        "行情",
+        "股票代码",
+        "港股",
+        "美股",
+        "A股",
+        "沪市",
+        "深市",
+        "比特币",
+        "BTC",
+        "quote",
+        "ticker",
+        "stock price",
+        "stock quote"
+      ],
+      "symbol": {
+        "patterns": [
+          "\\bBTC-USD\\b",
+          "\\b\\d{4}\\.HK\\b",
+          "\\b\\d{6}\\.(?:SS|SH|SZ)\\b",
+          "\\bBTC\\b",
+          "\\b[A-Z]{2,6}\\b"
+        ],
+        "aliases": {
+          "比特币": "BTC-USD",
+          "BITCOIN": "BTC-USD",
+          "BTC": "BTC-USD"
+        },
+        "normalizeSuffixes": {
+          ".SH": ".SS"
+        },
+        "blockedWords": [
+          "ST",
+          "US",
+          "HK",
+          "API",
+          "MCP",
+          "SKILL",
+          "SCRIPT",
+          "SYMBOL",
+          "TICKER",
+          "STOCK",
+          "QUOTE",
+          "PRICE",
+          "SHARE",
+          "MARKET",
+          "CURRENT",
+          "TODAY",
+          "README",
+          "JSON",
+          "HTML",
+          "CSS",
+          "DOM",
+          "URL",
+          "HTTP",
+          "HTTPS",
+          "FILE",
+          "FILES",
+          "FILESYSTEM",
+          "BROWSER",
+          "TOOL",
+          "TOOLS",
+          "TRACE",
+          "PENDING",
+          "APPROVAL",
+          "PROJECT",
+          "TITLE",
+          "HEAD",
+          "RUN",
+          "USD",
+          "CNY",
+          "HKD"
+        ],
+        "contextualPrefixes": [
+          "symbol",
+          "ticker",
+          "股票代码",
+          "代码"
+        ]
+      },
+      "risk": "low",
+      "readOnly": true,
+      "preferredOwner": "MELCHIOR-1",
+      "dedupe": {
+        "key": "market-quote:{extracted_symbol}",
+        "symbolArg": true,
+        "skipFallbackToolsOnSuccess": true
+      }
+    },
+    {
+      "id": "quote.instructions",
+      "description": "Load market quote routing, symbol resolution, provider, and freshness instructions.",
+      "toolId": "skill.run",
+      "mode": "load",
+      "triggers": [
+        "股价",
+        "股票行情",
+        "实时报价",
+        "行情",
+        "股票代码",
+        "港股",
+        "美股",
+        "A股",
+        "比特币",
+        "BTC",
+        "quote",
+        "ticker",
+        "stock price",
+        "stock quote"
+      ],
+      "risk": "low",
+      "readOnly": true
+    }
+  ]
+}

@@ -18,6 +18,10 @@ import {
   SessionTraceStep,
   StreamEvent,
   TextDeltaEvent,
+  SkillActionManifest,
+  SkillActionSymbolRule,
+  ToolAccessKey,
+  ToolAccessMode,
   ToolId,
   ToolTrace,
   AuditEvent,
@@ -27,6 +31,9 @@ import {
   getPersonaDocumentId,
   getPersonaMemoryDocumentId,
   hasToolPermission,
+  normalizeToolAccessMatrix,
+  normalizeRuntimeBudgets,
+  TOOL_ACCESS_DEFINITIONS,
 } from './harnessService';
 import { appendAuditEvents, BridgeSkill, BridgeStatus, executeBridgeTool, getBridgeStatus, listMcpTools } from './bridgeService';
 
@@ -41,6 +48,13 @@ interface TavilyResult {
   content: string;
 }
 
+interface WebFetchResult {
+  url: string;
+  title?: string;
+  content: string;
+  contentType?: string;
+}
+
 interface SystemConfig {
   name: string;
   archetype: string;
@@ -50,6 +64,13 @@ interface PlannedToolRequest {
   toolId: ToolId;
   arguments?: Record<string, unknown>;
   reason?: string;
+  metadata?: {
+    skillActionId?: string;
+    readOnly?: boolean;
+    preferredOwner?: MagiSystem;
+    dedupeKey?: string;
+    skipFallbackToolsOnSuccess?: boolean;
+  };
 }
 
 interface QueryMagiOptions {
@@ -212,6 +233,8 @@ const createChatParams = (
   return params;
 };
 
+const getRuntimeBudgets = (settings: HarnessSettings) => normalizeRuntimeBudgets(settings.runtimeBudgets);
+
 export const testModelConnection = async (settings: HarnessSettings) => {
   const startedAt = Date.now();
   const client = createClient(settings);
@@ -295,6 +318,61 @@ const truncateForPrompt = (value: unknown, maxLength = 6000) => {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   if (!text) return '';
   return text.length > maxLength ? `${text.slice(0, maxLength)}\n...[truncated]` : text;
+};
+
+const compactForTrace = (
+  value: unknown,
+  options: { maxDepth: number; maxString: number; maxArrayItems: number; maxObjectKeys: number },
+  depth = 0,
+  seen = new WeakSet<object>(),
+): unknown => {
+  if (typeof value === 'string') {
+    return value.length > options.maxString
+      ? `${value.slice(0, options.maxString)}\n...[truncated ${value.length - options.maxString} chars]`
+      : value;
+  }
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return '[Circular]';
+  if (depth >= options.maxDepth) return '[Max depth reached]';
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    const items = value
+      .slice(0, options.maxArrayItems)
+      .map(item => compactForTrace(item, options, depth + 1, seen));
+    if (value.length > options.maxArrayItems) {
+      items.push(`[...${value.length - options.maxArrayItems} more item(s)]`);
+    }
+    return items;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  const compacted: Record<string, unknown> = {};
+  entries.slice(0, options.maxObjectKeys).forEach(([key, item]) => {
+    compacted[key] = compactForTrace(item, options, depth + 1, seen);
+  });
+  if (entries.length > options.maxObjectKeys) {
+    compacted.__truncatedKeys = entries.length - options.maxObjectKeys;
+  }
+  return compacted;
+};
+
+const stringifyTraceDetails = (value: unknown, maxLength = 12000) => {
+  const passes = [
+    { maxDepth: 8, maxString: 2400, maxArrayItems: 30, maxObjectKeys: 80 },
+    { maxDepth: 6, maxString: 900, maxArrayItems: 16, maxObjectKeys: 45 },
+    { maxDepth: 5, maxString: 320, maxArrayItems: 10, maxObjectKeys: 28 },
+  ];
+
+  for (const options of passes) {
+    const text = JSON.stringify(compactForTrace(value, options), null, 2);
+    if (text.length <= maxLength) return text;
+  }
+
+  return JSON.stringify({
+    __truncated: true,
+    preview: truncateForPrompt(value, maxLength - 200),
+  }, null, 2);
 };
 
 const makeId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -474,15 +552,128 @@ const normalizeClarificationRequests = (
 
 const readOnlyMcpToolPattern = /^(read|list|get|search|find|stat|describe|inspect|directory_tree|list_allowed|browser_navigate|browser_read_page|browser_screenshot|browser_close)/i;
 const mutatingMcpToolPattern = /(^|_)(write|edit|delete|remove|move|rename|create|mkdir|touch|patch|update|replace|append|run|execute|shell|command|click|type|fill|submit)($|_)/i;
+const browserReadTools = new Set(['browser_navigate', 'browser_read_page', 'browser_screenshot', 'browser_close']);
+const browserInteractTools = new Set(['browser_click', 'browser_type']);
+
+const isReadOnlyMcpToolName = (toolName: string) =>
+  readOnlyMcpToolPattern.test(toolName) && !mutatingMcpToolPattern.test(toolName);
+
+const getToolAccessKey = (request: PlannedToolRequest): ToolAccessKey => {
+  if (request.toolId === 'web.search.tavily') return 'web.search.tavily';
+  if (request.toolId === 'web.fetch') return 'web.fetch';
+
+  if (request.toolId === 'skill.run') {
+    const mode = typeof request.arguments?.mode === 'string'
+      ? request.arguments.mode.toLowerCase()
+      : 'load';
+    return mode === 'load' ? 'skill.run.load' : 'skill.run.script';
+  }
+
+  const server = typeof request.arguments?.server === 'string'
+    ? request.arguments.server.toLowerCase()
+    : '';
+  const toolName = typeof request.arguments?.tool === 'string'
+    ? request.arguments.tool.toLowerCase()
+    : '';
+
+  if (server === 'filesystem') {
+    return isReadOnlyMcpToolName(toolName) ? 'mcp.filesystem.read' : 'mcp.filesystem.write';
+  }
+
+  if (server === 'browser') {
+    if (browserReadTools.has(toolName)) return 'mcp.browser.read';
+    if (browserInteractTools.has(toolName)) return 'mcp.browser.interact';
+    return isReadOnlyMcpToolName(toolName) ? 'mcp.browser.read' : 'mcp.browser.interact';
+  }
+
+  return isReadOnlyMcpToolName(toolName) ? 'mcp.other.read' : 'mcp.other.write';
+};
+
+const getToolAccessModeForKey = (
+  settings: HarnessSettings,
+  systemType: MagiSystem,
+  accessKey: ToolAccessKey,
+): ToolAccessMode => normalizeToolAccessMatrix(settings.toolAccess)[systemType][accessKey];
+
+const getToolAccessMode = (
+  settings: HarnessSettings,
+  systemType: MagiSystem,
+  request: PlannedToolRequest,
+): ToolAccessMode => getToolAccessModeForKey(settings, systemType, getToolAccessKey(request));
+
+const getPreferredOwnersForAccessKey = (accessKey: ToolAccessKey): MagiSystem[] => {
+  if (accessKey === 'web.search.tavily') return [MagiSystem.MELCHIOR, MagiSystem.CASPER, MagiSystem.BALTHASAR];
+  if (accessKey === 'web.fetch') return [MagiSystem.MELCHIOR, MagiSystem.CASPER, MagiSystem.BALTHASAR];
+  if (accessKey.startsWith('mcp.browser')) return [MagiSystem.CASPER, MagiSystem.MELCHIOR, MagiSystem.BALTHASAR];
+  if (accessKey.startsWith('mcp.filesystem')) return [MagiSystem.MELCHIOR, MagiSystem.BALTHASAR, MagiSystem.CASPER];
+  if (accessKey.startsWith('skill.run')) return [MagiSystem.BALTHASAR, MagiSystem.CASPER, MagiSystem.MELCHIOR];
+  return [MagiSystem.BALTHASAR, MagiSystem.MELCHIOR, MagiSystem.CASPER];
+};
+
+const canPersonaRequestAccessKey = (
+  settings: HarnessSettings,
+  systemType: MagiSystem,
+  accessKey: ToolAccessKey,
+) => getToolAccessModeForKey(settings, systemType, accessKey) !== 'deny';
+
+const shouldSuggestForPersona = (
+  settings: HarnessSettings,
+  systemType: MagiSystem,
+  accessKey: ToolAccessKey,
+) => {
+  const preferredOwner = getPreferredOwnersForAccessKey(accessKey)
+    .find(candidate => canPersonaRequestAccessKey(settings, candidate, accessKey));
+  return preferredOwner === systemType;
+};
+
+const canPersonaRequestTool = (
+  harness: MagiHarnessContext,
+  systemType: MagiSystem,
+  request: PlannedToolRequest,
+) =>
+  hasToolPermission(harness.documents, systemType, request.toolId) &&
+  getToolAccessMode(harness.settings, systemType, request) !== 'deny';
+
+const filterToolRequestsForPersona = (
+  requests: PlannedToolRequest[],
+  harness: MagiHarnessContext,
+  systemType: MagiSystem,
+) => requests.filter(request => canPersonaRequestTool(harness, systemType, request));
+
+const formatToolAccessForPersona = (settings: HarnessSettings, systemType: MagiSystem) => {
+  const matrix = normalizeToolAccessMatrix(settings.toolAccess)[systemType];
+  return TOOL_ACCESS_DEFINITIONS
+    .map(definition => `- ${definition.key}: ${matrix[definition.key]} (${definition.label})`)
+    .join('\n');
+};
+
+const requireReviewByMatrix = (
+  request: PlannedToolRequest,
+  assessment: ToolRiskAssessment,
+  accessKey: ToolAccessKey,
+): ToolRiskAssessment => {
+  if (assessment.requiresApproval) return assessment;
+  return {
+    risk: assessment.risk === 'low' ? 'medium' : assessment.risk,
+    requiresApproval: true,
+    summary: `Tool Access Matrix marks ${accessKey} as ASK/review. ${assessment.summary}`,
+  };
+};
+
+const isReadOnlySkillActionScript = (request: PlannedToolRequest) =>
+  request.toolId === 'skill.run' &&
+  request.metadata?.readOnly === true &&
+  typeof request.arguments?.mode === 'string' &&
+  request.arguments.mode.toLowerCase() === 'script';
 
 const assessToolRequestRisk = (request: PlannedToolRequest): ToolRiskAssessment => {
   const args = request.arguments || {};
 
-  if (request.toolId === 'web.search.tavily') {
+  if (request.toolId === 'web.search.tavily' || request.toolId === 'web.fetch') {
     return {
       risk: 'low',
       requiresApproval: false,
-      summary: 'External search is read-only and can run without approval.',
+      summary: `${request.toolId} is read-only and can run without approval.`,
     };
   }
 
@@ -497,9 +688,11 @@ const assessToolRequestRisk = (request: PlannedToolRequest): ToolRiskAssessment 
     }
 
     return {
-      risk: mode === 'script' ? 'high' : 'medium',
-      requiresApproval: true,
-      summary: `Skill mode "${mode}" may execute local workflow logic and needs approval.`,
+      risk: isReadOnlySkillActionScript(request) ? 'low' : mode === 'script' ? 'high' : 'medium',
+      requiresApproval: !isReadOnlySkillActionScript(request),
+      summary: isReadOnlySkillActionScript(request)
+        ? 'Skill action manifest marks this script as a read-only lookup.'
+        : `Skill mode "${mode}" may execute local workflow logic and needs approval.`,
     };
   }
 
@@ -512,7 +705,7 @@ const assessToolRequestRisk = (request: PlannedToolRequest): ToolRiskAssessment 
     };
   }
 
-  if (readOnlyMcpToolPattern.test(toolName)) {
+  if (isReadOnlyMcpToolName(toolName)) {
     return {
       risk: 'low',
       requiresApproval: false,
@@ -576,8 +769,106 @@ const extractMcpTools = (payload: unknown): RuntimeMcpTool[] => {
   return [];
 };
 
+const actionIntentPattern = /价格|当前|实时|报价|行情|查询|查|多少|price|quote|current|fetch|lookup|run|执行|获取/i;
+
+const getSkillActions = (runtime: RuntimeCapabilities | undefined) =>
+  runtime?.bridge?.skills.flatMap(skill =>
+    (skill.actions || []).map(action => ({ skill, action })),
+  ) || [];
+
+const actionTriggersQuery = (action: SkillActionManifest, userQuery: string) => {
+  const query = userQuery.toLowerCase();
+  return (action.triggers || []).some(trigger => query.includes(trigger.toLowerCase()));
+};
+
+const applySymbolNormalization = (symbol: string, rule?: SkillActionSymbolRule) => {
+  let normalized = symbol.trim().toUpperCase();
+  const aliasTarget = Object.entries(rule?.aliases || {})
+    .find(([alias]) => alias.toUpperCase() === normalized)?.[1];
+  if (aliasTarget) normalized = aliasTarget.trim().toUpperCase();
+  Object.entries(rule?.normalizeSuffixes || {}).forEach(([from, to]) => {
+    if (normalized.endsWith(from.toUpperCase())) {
+      normalized = `${normalized.slice(0, -from.length)}${to.toUpperCase()}`;
+    }
+  });
+  return normalized;
+};
+
+const isBlockedSymbolCandidate = (candidate: string, rule?: SkillActionSymbolRule) => {
+  const blocked = new Set((rule?.blockedWords || []).map(word => word.toUpperCase()));
+  return blocked.has(candidate.toUpperCase());
+};
+
+const uniqueStrings = (values: string[]) => Array.from(new Set(values.filter(Boolean)));
+
+const extractSkillActionSymbols = (action: SkillActionManifest, userQuery: string) => {
+  const rule = action.symbol;
+  if (!rule) return [];
+
+  const upperQuery = userQuery.toUpperCase();
+  const symbols: string[] = [];
+  const acceptedRanges: Array<readonly [number, number]> = [];
+  const isInsideAcceptedRange = (index: number) =>
+    acceptedRanges.some(([start, end]) => index >= start && index < end);
+
+  for (const [alias, symbol] of Object.entries(rule.aliases || {})) {
+    if (upperQuery.includes(alias.toUpperCase())) {
+      symbols.push(applySymbolNormalization(symbol, rule));
+    }
+  }
+
+  for (const prefix of rule.contextualPrefixes || []) {
+    const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`${escaped}\\s*[:：]?\\s*([A-Za-z0-9.-]{2,12})`, 'gi');
+    Array.from(userQuery.matchAll(regex)).forEach(match => {
+      if (match?.[1] && !isBlockedSymbolCandidate(match[1], rule)) {
+        symbols.push(applySymbolNormalization(match[1], rule));
+        const start = (match.index || 0) + match[0].lastIndexOf(match[1]);
+        acceptedRanges.push([start, start + match[1].length]);
+      }
+    });
+  }
+
+  const protectedRanges = (rule.contextualPrefixes || []).flatMap(prefix => {
+    const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`${escaped}\\s*[:：]?\\s*[A-Za-z0-9.-]{2,12}`, 'gi');
+    return Array.from(userQuery.matchAll(regex)).map(match => [match.index || 0, (match.index || 0) + match[0].length] as const);
+  });
+
+  const isInsideProtectedRange = (index: number) =>
+    protectedRanges.some(([start, end]) => index >= start && index < end);
+  const orderedPatterns = (rule.patterns || []).slice().sort((left, right) => right.length - left.length);
+  for (const pattern of orderedPatterns) {
+    try {
+      const regex = new RegExp(pattern, 'g');
+      Array.from(userQuery.matchAll(regex)).forEach(match => {
+        const candidate = match[0];
+        const index = match.index || 0;
+        if (!isBlockedSymbolCandidate(candidate, rule) && !isInsideProtectedRange(index) && !isInsideAcceptedRange(index)) {
+          symbols.push(applySymbolNormalization(candidate, rule));
+          acceptedRanges.push([index, index + candidate.length]);
+        }
+      });
+    } catch {
+      // Ignore malformed skill-provided patterns.
+    }
+  }
+
+  return uniqueStrings(symbols);
+};
+
+const extractSkillActionSymbol = (action: SkillActionManifest, userQuery: string) => {
+  return extractSkillActionSymbols(action, userQuery)[0] || '';
+};
+
+const skillActionMatchesQuery = (action: SkillActionManifest, userQuery: string) => {
+  if (actionTriggersQuery(action, userQuery)) return true;
+  const symbol = extractSkillActionSymbol(action, userQuery);
+  return Boolean(symbol) && actionIntentPattern.test(userQuery);
+};
+
 const shouldExpandRuntimeManifest = (userQuery: string) =>
-  /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|浏览|网页|搜索|联网|readme|repo|repository|source|file|directory|codebase|filesystem|mcp|tool|工具|skill|技能|能力|browser|web|search/.test(userQuery.toLowerCase());
+  /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|浏览|网页|搜索|联网|股价|股票|行情|报价|比特币|readme|repo|repository|source|file|directory|codebase|filesystem|mcp|tool|工具|skill|技能|能力|browser|web|search|quote|ticker|stock|btc/.test(userQuery.toLowerCase());
 
 const loadRuntimeCapabilities = async (
   onEvent?: QueryMagiOptions['onEvent'],
@@ -636,7 +927,17 @@ const loadRuntimeCapabilities = async (
 
 const compactSkill = (skill: BridgeSkill) => {
   const description = truncateForPrompt(skill.description || 'No description.', 220).replace(/\s+/g, ' ');
-  return `- ${skill.id}: ${description}`;
+  const actions = skill.actions?.length
+    ? ` actions=${skill.actions.map(action => action.id).join(',')}`
+    : '';
+  return `- ${skill.id}: ${description}${actions}`;
+};
+
+const compactSkillAction = (skill: BridgeSkill, action: SkillActionManifest) => {
+  const description = truncateForPrompt(action.description || 'No description.', 180).replace(/\s+/g, ' ');
+  const script = action.script ? ` script=${action.script}` : '';
+  const triggers = action.triggers?.length ? ` triggers=${action.triggers.slice(0, 8).join('|')}` : '';
+  return `- ${skill.id}.${action.id}: ${description}; tool=${action.toolId}; mode=${action.mode || 'load'}${script}; risk=${action.risk || 'medium'}; readOnly=${Boolean(action.readOnly)}${triggers}`;
 };
 
 const compactMcpTool = (tool: RuntimeMcpTool) => {
@@ -647,6 +948,23 @@ const compactMcpTool = (tool: RuntimeMcpTool) => {
   ].filter(Boolean).join(',');
   const description = truncateForPrompt(tool.description || tool.title || 'No description.', 220).replace(/\s+/g, ' ');
   return `- ${tool.name}${flags ? ` [${flags}]` : ''}: ${description}`;
+};
+
+const formatRuntimeClock = () => {
+  const now = new Date();
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+  const local = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(now);
+
+  return `Current local date/time: ${local}; time zone: ${timeZone}; UTC: ${now.toISOString()}. Resolve "today", "tomorrow", and other relative dates from this clock.`;
 };
 
 const formatRuntimeCapabilities = (runtime: RuntimeCapabilities, expanded: boolean) => {
@@ -660,6 +978,12 @@ const formatRuntimeCapabilities = (runtime: RuntimeCapabilities, expanded: boole
       ? bridge.skills.slice(0, 30).map(compactSkill).join('\n')
       : `Available skill ids: ${bridge.skills.map(skill => skill.id).slice(0, 40).join(', ')}`
     : 'NO SKILLS DISCOVERED BY BRIDGE.';
+  const skillActions = bridge?.skills?.length
+    ? bridge.skills
+      .flatMap(skill => (skill.actions || []).map(action => compactSkillAction(skill, action)))
+      .slice(0, expanded ? 30 : 12)
+      .join('\n')
+    : '';
 
   const hasFilesystem = runtime.mcpServers.some(server => server.server === 'filesystem');
   const hasBrowser = runtime.mcpServers.some(server => server.server === 'browser');
@@ -693,16 +1017,25 @@ This block is host/runtime-provided capability context, analogous to Codex tool 
 It is compact by default and expands MCP tool names only when the user task asks about local files, tools, MCP, skills, or code.
 Do not claim the browser sandbox prevents file inspection when the bridge is ONLINE and a filesystem MCP server is listed.
 
+${formatRuntimeClock()}
+
 Bridge: ${bridgeLine}
 
 ## Runtime Skills Available via skill.run load
 ${skills}
+
+## Runtime Skill Actions
+${skillActions || 'NO MACHINE-READABLE SKILL ACTIONS DISCOVERED.'}
 
 ## Runtime MCP Servers and Tools
 ${mcpServers}
 
 ## Tool-Use Rules From Runtime
 
+- Web retrieval route: use web_search_tavily for search/discovery and web_fetch for reading a known URL. This covers weather, news, general lookup, docs pages, and retrieval/crawling tasks.
+- Skill action route: when Runtime Skill Actions list a matching read-only script action, prefer that action over improvising API calls. Use the action's script, arguments, freshness fields, and fallback guidance from SKILL.md.
+- Browser MCP route: use browser tools only for real browser state: local UI inspection, current page DOM, screenshots, streaming UI checks, visual layout verification, click/type interaction, or form workflows.
+- If the user says no browser or no screenshot, that is a hard routing signal: use retrieval tools instead of Browser MCP.
 ${toolUseRules}
 ${browserRules}
 - To inspect a skill's instructions, request skill.run {"skill":"<runtime skill id>","mode":"load","task":"why the skill is needed"}.
@@ -722,14 +1055,166 @@ const runtimeHasSkill = (
   skillId: string,
 ) => Boolean(runtime?.bridge?.skills.some(skill => skill.id.toLowerCase() === skillId.toLowerCase()));
 
+const getToolRequestDedupeKey = (request: PlannedToolRequest) => {
+  if (request.metadata?.dedupeKey) return request.metadata.dedupeKey;
+  if (request.toolId === 'skill.run' && isSkillActionScriptRequest(request)) {
+    return JSON.stringify([
+      request.toolId,
+      typeof request.arguments?.skill === 'string' ? request.arguments.skill.toLowerCase() : '',
+      normalizeScriptPath(request.arguments?.script),
+      normalizeSymbolArg(request.arguments?.args),
+    ]);
+  }
+  return JSON.stringify([request.toolId, request.arguments]);
+};
+
 const appendUniqueToolRequest = (
   requests: PlannedToolRequest[],
   request: PlannedToolRequest,
 ) => {
-  const key = JSON.stringify([request.toolId, request.arguments]);
-  if (!requests.some(item => JSON.stringify([item.toolId, item.arguments]) === key)) {
+  const requestKey = getToolRequestDedupeKey(request);
+  if (!requests.some(item => getToolRequestDedupeKey(item) === requestKey)) {
     requests.push(request);
   }
+};
+
+const noBrowserIntentPattern = /(不需要|无需|不用|不要|别|禁止).{0,16}(浏览器|browser|截图|screenshot)|(no|without|don't|do not).{0,16}(browser|screenshot)/i;
+
+const userQueryBlocksBrowserMcp = (userQuery: string) => noBrowserIntentPattern.test(userQuery);
+
+const isBrowserMcpRequest = (request: PlannedToolRequest) =>
+  request.toolId === 'mcp.call' &&
+  typeof request.arguments?.server === 'string' &&
+  request.arguments.server.toLowerCase() === 'browser';
+
+const filterToolRequestsForUserIntent = (
+  requests: PlannedToolRequest[],
+  userQuery: string,
+) => userQueryBlocksBrowserMcp(userQuery)
+  ? requests.filter(request => !isBrowserMcpRequest(request))
+  : requests;
+
+const isSkillActionScriptRequest = (request: PlannedToolRequest) =>
+  request.toolId === 'skill.run' &&
+  typeof request.arguments?.mode === 'string' &&
+  request.arguments.mode.toLowerCase() === 'script' &&
+  typeof request.arguments?.script === 'string';
+
+const isSkillLoadRequest = (request: PlannedToolRequest) =>
+  request.toolId === 'skill.run' &&
+  (typeof request.arguments.mode !== 'string' || request.arguments.mode.toLowerCase() === 'load');
+
+const prioritizeToolRequestsForUserIntent = (
+  requests: PlannedToolRequest[],
+  userQuery: string,
+) => {
+  if (!requests.some(request => request.metadata?.skillActionId)) return requests;
+
+  const priority = (request: PlannedToolRequest) => {
+    if (isSkillActionScriptRequest(request)) return 0;
+    if (request.toolId === 'web.fetch') return 1;
+    if (request.toolId === 'web.search.tavily') return 2;
+    if (isSkillLoadRequest(request)) return 3;
+    return 4;
+  };
+
+  return requests
+    .map((request, index) => ({ request, index }))
+    .sort((left, right) => priority(left.request) - priority(right.request) || left.index - right.index)
+    .map(item => item.request);
+};
+
+const bridgeResultIndicatesFailure = (request: PlannedToolRequest, result: unknown) => {
+  if (
+    request.toolId === 'mcp.call' &&
+    result &&
+    typeof result === 'object' &&
+    (result as { result?: { isError?: unknown } }).result?.isError === true
+  ) {
+    return true;
+  }
+
+  if (request.toolId !== 'skill.run' || !result || typeof result !== 'object') return false;
+
+  const skillResult = result as {
+    mode?: unknown;
+    result?: {
+      exitCode?: unknown;
+      stdout?: unknown;
+    };
+  };
+  if (skillResult.mode !== 'script') return false;
+
+  const commandResult = skillResult.result;
+  if (!commandResult || typeof commandResult !== 'object') return false;
+  if (typeof commandResult.exitCode === 'number' && commandResult.exitCode !== 0) return true;
+
+  if (typeof commandResult.stdout === 'string') {
+    const stdout = commandResult.stdout.trim();
+    if (!stdout.startsWith('{')) return false;
+    try {
+      const parsed = JSON.parse(stdout) as { ok?: unknown };
+      return parsed.ok === false;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+};
+
+const parseSkillScriptStdoutJson = (result: unknown) => {
+  if (!result || typeof result !== 'object') return null;
+  const commandResult = (result as { result?: { stdout?: unknown } }).result;
+  const stdout = typeof commandResult?.stdout === 'string' ? commandResult.stdout.trim() : '';
+  if (!stdout.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(stdout);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const formatParsedQuoteResult = (parsed: Record<string, unknown>) => {
+  if (!('price' in parsed) || !('source' in parsed)) return '';
+  const freshness = parsed.freshness && typeof parsed.freshness === 'object'
+    ? parsed.freshness as Record<string, unknown>
+    : {};
+  return [
+    'Parsed quote result (authoritative for final answer):',
+    `inputSymbol: ${parsed.inputSymbol || ''}`,
+    `normalizedSymbol: ${parsed.normalizedSymbol || parsed.symbol || ''}`,
+    `source: ${parsed.source || ''}`,
+    `price: ${parsed.price ?? ''}`,
+    `currency: ${parsed.currency || ''}`,
+    `quoteTime: ${parsed.quoteTime || ''}`,
+    `freshness.status: ${freshness.status || ''}`,
+    `freshness.ageSeconds: ${freshness.ageSeconds ?? ''}`,
+    `delay: ${parsed.delay || ''}`,
+  ].join('\n');
+};
+
+const coordinateInitialToolRequests = (
+  requests: PlannedToolRequest[],
+  systemType: MagiSystem,
+  userQuery: string,
+) => {
+  const actionScriptRequests = requests.filter(request =>
+    request.metadata?.skillActionId &&
+    isSkillActionScriptRequest(request) &&
+    request.metadata.preferredOwner,
+  );
+  if (actionScriptRequests.length === 0) return requests;
+  const owned = actionScriptRequests.some(request => request.metadata?.preferredOwner === systemType);
+  if (owned) {
+    return requests.some(isSkillActionScriptRequest)
+      ? requests.filter(request => request.metadata?.preferredOwner === systemType && isSkillActionScriptRequest(request))
+      : requests;
+  }
+  return requests.filter(request => !actionScriptRequests.includes(request));
 };
 
 const nativePlanningTools = [
@@ -737,7 +1222,7 @@ const nativePlanningTools = [
     type: 'function',
     function: {
       name: 'web_search_tavily',
-      description: 'Search the web through Tavily. Read-only and low risk.',
+      description: 'Search the web through Tavily for factual retrieval such as weather, news, documentation discovery, or finding source URLs. Read-only and low risk.',
       parameters: {
         type: 'object',
         properties: {
@@ -751,6 +1236,32 @@ const nativePlanningTools = [
           },
         },
         required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description: 'Fetch and extract readable text from a specific URL. Use for retrieval/crawling of a known web page; do not use Browser MCP unless the task needs real browser UI state, screenshots, or interaction.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: 'HTTP or HTTPS URL to fetch.',
+          },
+          maxChars: {
+            type: 'number',
+            description: 'Maximum extracted text characters to return. Default 12000.',
+          },
+          reason: {
+            type: 'string',
+            description: 'Brief reason this page fetch is needed.',
+          },
+        },
+        required: ['url'],
         additionalProperties: false,
       },
     },
@@ -868,6 +1379,19 @@ const nativeToolCallToRequest = (toolCall: unknown): PlannedToolRequest | null =
     };
   }
 
+  if (name === 'web_fetch') {
+    const url = typeof args.url === 'string' ? args.url.trim() : '';
+    if (!url) return null;
+    return {
+      toolId: 'web.fetch',
+      arguments: {
+        url,
+        maxChars: typeof args.maxChars === 'number' ? args.maxChars : 12000,
+      },
+      reason,
+    };
+  }
+
   if (name === 'skill_run') {
     const skill = typeof args.skill === 'string' ? args.skill.trim() : '';
     if (!skill) return null;
@@ -915,7 +1439,7 @@ const planNativeToolCalls = async (
     model: modelName,
     messages: [{ role: 'system', content: promptText }],
     temperature: 0.1,
-    max_tokens: 1024,
+    max_tokens: getRuntimeBudgets(settings).plannerMaxTokens,
     tools: nativePlanningTools as unknown as unknown[],
     tool_choice: 'auto',
   }) as any);
@@ -942,28 +1466,148 @@ const extractReferencedFilePath = (userQuery: string) => {
   return match?.[0]?.replace(/\\/g, '/') || '';
 };
 
+const materializeSkillActionArgs = (
+  action: SkillActionManifest,
+  userQuery: string,
+  symbol?: string,
+) => (action.args || []).map(arg => {
+  if (arg.from === 'extracted_symbol') return symbol || extractSkillActionSymbol(action, userQuery);
+  return arg.value || '';
+}).filter(value => value !== '');
+
+const buildSkillActionToolRequest = (
+  skill: BridgeSkill,
+  action: SkillActionManifest,
+  userQuery: string,
+  symbol?: string,
+): PlannedToolRequest | null => {
+  if (action.toolId !== 'skill.run') return null;
+  const mode = action.mode || 'load';
+  if (mode === 'script' && !action.script) return null;
+  const extractedSymbol = symbol || extractSkillActionSymbol(action, userQuery);
+  if ((action.args || []).some(arg => arg.from === 'extracted_symbol') && !extractedSymbol) {
+    return null;
+  }
+  const args = materializeSkillActionArgs(action, userQuery, extractedSymbol);
+  return {
+    toolId: 'skill.run',
+    arguments: {
+      skill: skill.id,
+      mode,
+      ...(action.script ? { script: action.script } : {}),
+      ...(args.length ? { args } : {}),
+      task: action.description || `Run skill action ${action.id}.`,
+    },
+    reason: `Use skill action ${skill.id}.${action.id}${extractedSymbol ? ` for ${extractedSymbol}` : ''}.`,
+    metadata: {
+      skillActionId: `${skill.id}.${action.id}`,
+      readOnly: action.readOnly === true,
+      preferredOwner: action.preferredOwner,
+      dedupeKey: action.dedupe?.key && extractedSymbol
+        ? action.dedupe.key.replace('{extracted_symbol}', extractedSymbol)
+        : undefined,
+      skipFallbackToolsOnSuccess: action.dedupe?.skipFallbackToolsOnSuccess,
+    },
+  };
+};
+
+const getMatchingSkillActionRequests = (
+  runtime: RuntimeCapabilities | undefined,
+  userQuery: string,
+) => getSkillActions(runtime).flatMap(({ skill, action }) => {
+  if (!skillActionMatchesQuery(action, userQuery)) return [];
+  if (action.mode === 'script' && !runtime?.bridge?.allowSkillScripts) return [];
+  const requiresSymbol = (action.args || []).some(arg => arg.from === 'extracted_symbol');
+  const symbols = requiresSymbol ? extractSkillActionSymbols(action, userQuery) : [''];
+  return symbols
+    .map(symbol => buildSkillActionToolRequest(skill, action, userQuery, symbol || undefined))
+    .filter((request): request is PlannedToolRequest => Boolean(request));
+});
+
+const hasMatchingSkillActions = (
+  runtime: RuntimeCapabilities | undefined,
+  userQuery: string,
+) => getSkillActions(runtime).some(({ action }) => skillActionMatchesQuery(action, userQuery));
+
+const annotateSkillActionRequest = (
+  request: PlannedToolRequest,
+  runtime: RuntimeCapabilities | undefined,
+  userQuery: string,
+): PlannedToolRequest => {
+  if (request.toolId !== 'skill.run') return request;
+  const skillId = typeof request.arguments?.skill === 'string' ? request.arguments.skill.toLowerCase() : '';
+  const script = normalizeScriptPath(request.arguments?.script);
+  const symbol = normalizeSymbolArg(request.arguments?.args);
+  if (!skillId) return request;
+
+  const match = getSkillActions(runtime).find(({ skill, action }) => {
+    if (skill.id !== skillId) return false;
+    if (action.toolId !== 'skill.run') return false;
+    if ((action.mode || 'load') !== (typeof request.arguments?.mode === 'string' ? request.arguments.mode : 'load')) return false;
+    if (action.script && normalizeScriptPath(action.script) !== script) return false;
+    const actionSymbol = extractSkillActionSymbol(action, userQuery);
+    return !actionSymbol || !symbol || actionSymbol === symbol;
+  });
+
+  if (!match) return request;
+  return {
+    ...request,
+    metadata: {
+      ...request.metadata,
+      skillActionId: `${match.skill.id}.${match.action.id}`,
+      readOnly: match.action.readOnly === true,
+      preferredOwner: match.action.preferredOwner,
+      dedupeKey: match.action.dedupe?.key && symbol
+        ? match.action.dedupe.key.replace('{extracted_symbol}', symbol)
+        : request.metadata?.dedupeKey,
+      skipFallbackToolsOnSuccess: match.action.dedupe?.skipFallbackToolsOnSuccess,
+    },
+  };
+};
+
+const annotateSkillActionRequests = (
+  requests: PlannedToolRequest[],
+  runtime: RuntimeCapabilities | undefined,
+  userQuery: string,
+) => requests.map(request => annotateSkillActionRequest(request, runtime, userQuery));
+
 const suggestRuntimeToolRequests = (
   systemType: MagiSystem,
   userQuery: string,
   runtime: RuntimeCapabilities | undefined,
+  settings: HarnessSettings,
 ): PlannedToolRequest[] => {
   const query = userQuery.toLowerCase();
   const requests: PlannedToolRequest[] = [];
-  const asksAboutFiles = /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|readme|repo|repository|source|file|directory|codebase|filesystem/.test(query);
+  const skillActionRequests = getMatchingSkillActionRequests(runtime, userQuery);
+  const hasActionMatch = skillActionRequests.length > 0;
+  const asksAboutFiles = !hasActionMatch &&
+    /代码|源码|文件|目录|仓库|项目|本体|实现|组件|服务|readme|repo|repository|source|file|directory|codebase|filesystem/.test(query);
   const asksAboutSkills = /skill|技能|能力包|加载|详情|instructions|skill\.md/.test(query);
-  const asksAboutBrowsing = /浏览|网页|搜索|联网|browser|web|search/.test(query);
+  const asksForWebRetrieval = !hasActionMatch &&
+    /搜索|联网|查询|天气|新闻|资料|网页|网址|抓取|检索|search|web|fetch|lookup|news|weather|http/.test(query);
+  const asksForBrowserState = !userQueryBlocksBrowserMcp(userQuery) &&
+    /浏览器|当前页|打开页面|看界面|截图|点击|输入|表单|页面验证|界面验证|ui|browser|screenshot|click|type|form|dom|visual|localhost|127\.0\.0\.1/.test(query);
   const referencedFile = extractReferencedFilePath(userQuery);
   const urlMatch = userQuery.match(/https?:\/\/[^\s"'<>]+|localhost:\d+[^\s"'<>]*|127\.0\.0\.1:\d+[^\s"'<>]*/i);
-  const browserUrl = urlMatch
+  const referencedUrl = urlMatch
     ? (urlMatch[0].startsWith('http') ? urlMatch[0] : `http://${urlMatch[0]}`)
     : '';
+  skillActionRequests.forEach(request => {
+    const accessKey = getToolAccessKey(request);
+    const preferredOwner = request.metadata?.preferredOwner;
+    const ownedByPersona = preferredOwner
+      ? preferredOwner === systemType && canPersonaRequestAccessKey(settings, systemType, accessKey)
+      : shouldSuggestForPersona(settings, systemType, accessKey);
+    if (ownedByPersona) appendUniqueToolRequest(requests, request);
+  });
 
   const hasFilesystemDirectoryRead = runtimeHasMcpTool(runtime, 'filesystem', 'list_directory') ||
     runtimeHasMcpTool(runtime, 'filesystem', 'directory_tree') ||
     runtimeHasMcpTool(runtime, 'filesystem', 'read_text_file');
 
   if (asksAboutFiles && hasFilesystemDirectoryRead) {
-    if (systemType === MagiSystem.MELCHIOR && referencedFile && runtimeHasMcpTool(runtime, 'filesystem', 'read_text_file')) {
+    if (shouldSuggestForPersona(settings, systemType, 'mcp.filesystem.read') && referencedFile && runtimeHasMcpTool(runtime, 'filesystem', 'read_text_file')) {
       appendUniqueToolRequest(requests, {
         toolId: 'mcp.call',
         arguments: {
@@ -976,7 +1620,7 @@ const suggestRuntimeToolRequests = (
         },
         reason: `The user asked about ${referencedFile}; read that file directly through filesystem MCP.`,
       });
-    } else if (systemType === MagiSystem.MELCHIOR) {
+    } else if (shouldSuggestForPersona(settings, systemType, 'mcp.filesystem.read')) {
       const useListDirectory = runtimeHasMcpTool(runtime, 'filesystem', 'list_directory');
       appendUniqueToolRequest(requests, {
         toolId: 'mcp.call',
@@ -994,7 +1638,11 @@ const suggestRuntimeToolRequests = (
       });
     }
 
-    if (systemType === MagiSystem.BALTHASAR && runtimeHasMcpTool(runtime, 'filesystem', 'list_allowed_directories')) {
+    if (
+      shouldSuggestForPersona(settings, systemType, 'mcp.filesystem.read') &&
+      runtimeHasMcpTool(runtime, 'filesystem', 'list_allowed_directories') &&
+      requests.length === 0
+    ) {
       appendUniqueToolRequest(requests, {
         toolId: 'mcp.call',
         arguments: {
@@ -1013,7 +1661,7 @@ const suggestRuntimeToolRequests = (
       (skill.name && query.includes(skill.name.toLowerCase())),
     );
 
-    if (matchedSkill && runtimeHasSkill(runtime, matchedSkill.id)) {
+    if (shouldSuggestForPersona(settings, systemType, 'skill.run.load') && matchedSkill && runtimeHasSkill(runtime, matchedSkill.id)) {
       appendUniqueToolRequest(requests, {
         toolId: 'skill.run',
         arguments: {
@@ -1026,23 +1674,44 @@ const suggestRuntimeToolRequests = (
     }
   }
 
-  if (asksAboutBrowsing && runtime?.bridge?.skills?.length) {
-    if (systemType === MagiSystem.CASPER && runtimeHasMcpTool(runtime, 'browser', 'browser_navigate') && browserUrl) {
+  if (asksForWebRetrieval && !asksForBrowserState) {
+    if (referencedUrl && shouldSuggestForPersona(settings, systemType, 'web.fetch')) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'web.fetch',
+        arguments: {
+          url: referencedUrl,
+          maxChars: 12000,
+        },
+        reason: `Fetch the referenced URL directly. Browser MCP is not needed because the task is retrieval, not UI verification.`,
+      });
+    } else if (shouldSuggestForPersona(settings, systemType, 'web.search.tavily')) {
+      appendUniqueToolRequest(requests, {
+        toolId: 'web.search.tavily',
+        arguments: {
+          query: userQuery,
+        },
+        reason: 'Use web search for information retrieval instead of opening a browser session.',
+      });
+    }
+  }
+
+  if (asksForBrowserState) {
+    if (shouldSuggestForPersona(settings, systemType, 'mcp.browser.read') && runtimeHasMcpTool(runtime, 'browser', 'browser_navigate') && referencedUrl) {
       appendUniqueToolRequest(requests, {
         toolId: 'mcp.call',
         arguments: {
           server: 'browser',
           tool: 'browser_navigate',
           arguments: {
-            url: browserUrl,
+            url: referencedUrl,
             waitUntil: 'domcontentloaded',
           },
         },
-        reason: `The user asked for browser verification; navigate to ${browserUrl}.`,
+        reason: `The user asked for browser/UI verification; navigate to ${referencedUrl}.`,
       });
     }
 
-    if (systemType === MagiSystem.CASPER && runtimeHasMcpTool(runtime, 'browser', 'browser_read_page')) {
+    if (shouldSuggestForPersona(settings, systemType, 'mcp.browser.read') && runtimeHasMcpTool(runtime, 'browser', 'browser_read_page')) {
       appendUniqueToolRequest(requests, {
         toolId: 'mcp.call',
         arguments: {
@@ -1052,14 +1721,14 @@ const suggestRuntimeToolRequests = (
             maxChars: 12000,
           },
         },
-        reason: 'Read the current browser page through Browser MCP before making claims about the UI.',
+        reason: 'Read the current browser page through Browser MCP because the task concerns browser/UI state.',
       });
     }
 
     const wantsBrowserSkillDetails = asksAboutSkills || /浏览器能力|浏览器技能|browser capability|browser skill|browser-verification/i.test(userQuery);
-    const browserSkill = runtime.bridge.skills.find(skill => skill.id === 'browser') ||
-      runtime.bridge.skills.find(skill => skill.id === 'browser-verification');
-    if (systemType === MagiSystem.CASPER && wantsBrowserSkillDetails && browserSkill && runtimeHasSkill(runtime, browserSkill.id)) {
+    const browserSkill = runtime?.bridge?.skills.find(skill => skill.id === 'browser') ||
+      runtime?.bridge?.skills.find(skill => skill.id === 'browser-verification');
+    if (shouldSuggestForPersona(settings, systemType, 'skill.run.load') && wantsBrowserSkillDetails && browserSkill && runtimeHasSkill(runtime, browserSkill.id)) {
       appendUniqueToolRequest(requests, {
         toolId: 'skill.run',
         arguments: {
@@ -1072,7 +1741,7 @@ const suggestRuntimeToolRequests = (
     }
   }
 
-  return requests.slice(0, 2);
+  return requests.slice(0, getRuntimeBudgets(settings).runtimeSuggestMaxRequests);
 };
 
 const normalizeDocumentOperations = (
@@ -1119,6 +1788,7 @@ const isConcreteActionRequest = (userQuery: string) => concreteActionPattern.tes
 
 const isReadOnlyToolTrace = (trace: ToolTrace) =>
   trace.toolId === 'web.search.tavily' ||
+  trace.toolId === 'web.fetch' ||
   /skill\.run/.test(trace.toolId) ||
   /read|list|get|search|find|stat|describe|inspect|directory_tree|list_allowed|browser_navigate|browser_read_page|browser_screenshot|browser_close/i.test(trace.details || trace.summary || trace.toolId);
 
@@ -1139,59 +1809,111 @@ const shouldKeepClarification = (
   return !genericClarificationPattern.test(`${request.question}\n${request.reason || ''}`);
 };
 
-const shouldPersonaOwnToolRequest = (systemType: MagiSystem, request: PlannedToolRequest) => {
-  if (request.toolId === 'web.search.tavily') return systemType === MagiSystem.MELCHIOR;
-
-  if (request.toolId === 'skill.run') {
-    const skill = typeof request.arguments?.skill === 'string' ? request.arguments.skill.toLowerCase() : '';
-    if (/browser|visual|ui|verification/.test(skill)) return systemType === MagiSystem.CASPER;
-    if (/mcp|tool|permission|safety|audit/.test(skill)) return systemType === MagiSystem.BALTHASAR;
+const getToolRequestOwner = (request: PlannedToolRequest, harness: MagiHarnessContext): MagiSystem => {
+  if (request.metadata?.preferredOwner && canPersonaRequestTool(harness, request.metadata.preferredOwner, request)) {
+    return request.metadata.preferredOwner;
   }
-
-  if (request.toolId === 'mcp.call') {
-    const server = typeof request.arguments?.server === 'string' ? request.arguments.server : '';
-    const tool = typeof request.arguments?.tool === 'string' ? request.arguments.tool : '';
-    if (server === 'browser') return systemType === MagiSystem.CASPER;
-    if (server === 'filesystem' && /list_allowed/i.test(tool)) return systemType === MagiSystem.BALTHASAR;
-    if (server === 'filesystem') return systemType === MagiSystem.MELCHIOR;
-  }
-
-  return true;
+  const accessKey = getToolAccessKey(request);
+  const preferred = getPreferredOwnersForAccessKey(accessKey);
+  return preferred.find(systemType => canPersonaRequestTool(harness, systemType, request)) ||
+    Object.values(MagiSystem).find(systemType => canPersonaRequestTool(harness, systemType, request)) ||
+    preferred[0] ||
+    MagiSystem.MELCHIOR;
 };
 
-const getToolRequestOwner = (request: PlannedToolRequest): MagiSystem => {
-  if (request.toolId === 'web.search.tavily') return MagiSystem.MELCHIOR;
-
-  if (request.toolId === 'skill.run') {
-    const skill = typeof request.arguments?.skill === 'string' ? request.arguments.skill.toLowerCase() : '';
-    if (/browser|visual|ui|verification/.test(skill)) return MagiSystem.CASPER;
-    if (/mcp|tool|permission|safety|audit/.test(skill)) return MagiSystem.BALTHASAR;
-    return MagiSystem.MELCHIOR;
+const parseTraceDetailsObject = (details?: string): Record<string, unknown> | null => {
+  if (!details) return null;
+  try {
+    const parsed = JSON.parse(details);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
   }
-
-  if (request.toolId === 'mcp.call') {
-    const server = typeof request.arguments?.server === 'string' ? request.arguments.server : '';
-    const tool = typeof request.arguments?.tool === 'string' ? request.arguments.tool : '';
-    if (server === 'browser') return MagiSystem.CASPER;
-    if (server === 'filesystem' && /list_allowed/i.test(tool)) return MagiSystem.BALTHASAR;
-    if (server === 'filesystem') return MagiSystem.MELCHIOR;
-  }
-
-  return MagiSystem.MELCHIOR;
 };
 
-const toolRequestAlreadyAttempted = (request: PlannedToolRequest, traces: ToolTrace[]) => {
+const normalizeScriptPath = (value: unknown) =>
+  typeof value === 'string' ? value.replace(/\\/g, '/').toLowerCase() : '';
+
+const normalizeToolArgList = (value: unknown) =>
+  Array.isArray(value) ? value.map(item => String(item)) : [];
+
+const normalizeSymbolArg = (value: unknown) =>
+  normalizeToolArgList(value)
+    .find(item => item.trim() && !item.trim().startsWith('-'))
+    ?.trim()
+    .toUpperCase()
+    .replace(/\.SH$/, '.SS') || '';
+
+const getTraceRequestObject = (trace: ToolTrace): Record<string, unknown> | null => {
+  const details = parseTraceDetailsObject(trace.details);
+  const request = details?.request;
+  return request && typeof request === 'object' && !Array.isArray(request)
+    ? request as Record<string, unknown>
+    : null;
+};
+
+const getTraceMetadataObject = (trace: ToolTrace): PlannedToolRequest['metadata'] | null => {
+  const details = parseTraceDetailsObject(trace.details);
+  const metadata = details?.metadata;
+  return metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? metadata as PlannedToolRequest['metadata']
+    : null;
+};
+
+const hasSuccessfulFallbackBlockingSkillActionTrace = (traces: ToolTrace[]) =>
+  traces.some(trace =>
+    trace.toolId === 'skill.run' &&
+    trace.status === 'allowed' &&
+    getTraceMetadataObject(trace)?.skipFallbackToolsOnSuccess === true,
+  );
+
+const toolRequestAlreadyAttempted = (request: PlannedToolRequest, traces: ToolTrace[], userQuery = '') => {
+  if (
+    userQuery &&
+    hasSuccessfulFallbackBlockingSkillActionTrace(traces) &&
+    (request.toolId === 'web.search.tavily' || request.toolId === 'web.fetch' || request.toolId === 'mcp.call')
+  ) {
+    return true;
+  }
+
   if (request.toolId === 'web.search.tavily') {
     const query = typeof request.arguments?.query === 'string' ? request.arguments.query.trim() : '';
     return Boolean(query) && traces.some(trace => trace.toolId === 'web.search.tavily' && trace.query === query);
   }
 
+  if (request.toolId === 'web.fetch') {
+    const url = typeof request.arguments?.url === 'string' ? request.arguments.url.trim() : '';
+    return Boolean(url) && traces.some(trace =>
+      trace.toolId === 'web.fetch' &&
+      (trace.query === url || trace.details?.includes(`"url": "${url}"`)),
+    );
+  }
+
   if (request.toolId === 'skill.run') {
     const skill = typeof request.arguments?.skill === 'string' ? request.arguments.skill.trim() : '';
-    return Boolean(skill) && traces.some(trace =>
-      trace.toolId === 'skill.run' &&
-      trace.details?.includes(`"skill": "${skill}"`),
-    );
+    if (!skill) return false;
+    const mode = typeof request.arguments?.mode === 'string' ? request.arguments.mode.toLowerCase() : 'load';
+    const script = normalizeScriptPath(request.arguments?.script);
+    const symbolArg = normalizeSymbolArg(request.arguments?.args);
+
+    return traces.some(trace => {
+      if (trace.toolId !== 'skill.run' || trace.status !== 'allowed') return false;
+      const traceRequest = getTraceRequestObject(trace);
+      if (!traceRequest) return false;
+      const traceSkill = typeof traceRequest.skill === 'string' ? traceRequest.skill.trim() : '';
+      if (traceSkill !== skill) return false;
+      const traceMode = typeof traceRequest.mode === 'string' ? traceRequest.mode.toLowerCase() : 'load';
+      if (traceMode !== mode) return false;
+      if (mode !== 'script') return true;
+      const traceScript = normalizeScriptPath(traceRequest.script);
+      const traceSymbolArg = normalizeSymbolArg(traceRequest.args);
+      return Boolean(script) &&
+        traceScript === script &&
+        Boolean(symbolArg) &&
+        traceSymbolArg === symbolArg;
+    });
   }
 
   if (request.toolId === 'mcp.call') {
@@ -1261,33 +1983,42 @@ const createOfflineNode = (systemType: MagiSystem, summary = 'CONNECTION LOST. N
 const planPersonaTools = async (
   client: OpenAI,
   modelName: string,
-  settings: HarnessSettings,
+  harness: MagiHarnessContext,
   systemType: MagiSystem,
   harnessBlock: string,
   userQuery: string,
   runtime: RuntimeCapabilities,
 ): Promise<PlannedToolRequest[]> => {
   const config = systemConfigs[systemType];
+  const budgets = getRuntimeBudgets(harness.settings);
 
   const prompt = `
 You are ${config.name}. Decide whether any permitted tools are useful at this first action opportunity before your main analysis.
 
 ${harnessBlock}
 
+## Tool Access Matrix For ${config.name}
+${formatToolAccessForPersona(harness.settings, systemType)}
+
 You have native function tools available:
 - web_search_tavily -> web.search.tavily
+- web_fetch -> web.fetch
 - skill_run -> skill.run
 - mcp_call -> mcp.call
 
-Call only tools that are directly useful and permissioned by the registry. Prefer at most two calls. If no tool is useful, return no tool calls.
+Call only tools that are directly useful and permissioned by the registry and Tool Access Matrix. Prefer at most ${budgets.initialToolMaxRequests} calls. If no tool is useful, return no tool calls.
 
 Important:
 - The Authoritative Runtime Tool Manifest is live. Trust it over stale memory.
 - Action is available throughout the whole run: analysis, council, synthesis, and approved execution. This is only the first chance to act.
 - When a low-risk tool can answer or verify the task, request it now instead of proposing that the user approve a future test.
+- For information retrieval such as weather, news, factual lookup, docs discovery, or reading a known URL, use web_search_tavily or web_fetch. Do not use Browser MCP for retrieval-only tasks.
+- Use Browser MCP only when the task needs real browser state: local UI inspection, current page DOM, screenshot, click/type interaction, streaming UI verification, or visual layout checks.
+- If the user explicitly says they do not need a browser or screenshot, do not call mcp_call with server="browser".
 - If the user asks about local code, files, repo structure, or whether MAGI can access the project, use filesystem MCP when it is listed.
 - Do not answer "browser sandbox cannot access filesystem" when bridge is online and filesystem MCP tools are listed. Request mcp.call instead.
 - If the user asks for skill details and a matching runtime skill is listed, request skill.run with mode "load".
+- If Runtime Skill Actions include a matching read-only script action, use the action's declared script and arguments instead of inventing a one-off route.
 
 Concrete examples when filesystem MCP is available:
 - repository root: call mcp_call with server="filesystem", tool="list_directory", arguments={ "path": "." }
@@ -1305,16 +2036,48 @@ User query: "${userQuery}"
 `;
 
   try {
-    const planned = await planNativeToolCalls(client, modelName, settings, prompt, `${config.name} TOOL PLANNER`, 2);
+    const planned = annotateSkillActionRequests(filterToolRequestsForUserIntent(
+      await planNativeToolCalls(client, modelName, harness.settings, prompt, `${config.name} TOOL PLANNER`, budgets.initialToolMaxRequests),
+      userQuery,
+    ), runtime, userQuery);
     if (planned.length === 0) {
-      return suggestRuntimeToolRequests(systemType, userQuery, runtime);
+      return prioritizeToolRequestsForUserIntent(
+        coordinateInitialToolRequests(
+          filterToolRequestsForPersona(
+            filterToolRequestsForUserIntent(suggestRuntimeToolRequests(systemType, userQuery, runtime, harness.settings), userQuery),
+            harness,
+            systemType,
+          ),
+          systemType,
+          userQuery,
+        ),
+        userQuery,
+      );
     }
     const augmented = [...planned];
-    suggestRuntimeToolRequests(systemType, userQuery, runtime).forEach(request => appendUniqueToolRequest(augmented, request));
-    return augmented.slice(0, 2);
+    suggestRuntimeToolRequests(systemType, userQuery, runtime, harness.settings).forEach(request => appendUniqueToolRequest(augmented, request));
+    return prioritizeToolRequestsForUserIntent(
+      coordinateInitialToolRequests(
+        filterToolRequestsForPersona(filterToolRequestsForUserIntent(augmented, userQuery), harness, systemType),
+        systemType,
+        userQuery,
+      ),
+      userQuery,
+    ).slice(0, budgets.initialToolMaxRequests);
   } catch (error) {
     console.warn(`[${config.name}] Tool-planning step failed.`, error);
-    return suggestRuntimeToolRequests(systemType, userQuery, runtime);
+    return prioritizeToolRequestsForUserIntent(
+      coordinateInitialToolRequests(
+        filterToolRequestsForPersona(
+          filterToolRequestsForUserIntent(suggestRuntimeToolRequests(systemType, userQuery, runtime, harness.settings), userQuery),
+          harness,
+          systemType,
+        ),
+        systemType,
+        userQuery,
+      ),
+      userQuery,
+    );
   }
 };
 
@@ -1330,22 +2093,32 @@ const executeToolRequests = async (
   const pendingActions: PendingAction[] = [];
   const streamEvents: StreamEvent[] = [];
   const toolResultBlocks: string[] = [];
+  const budgets = getRuntimeBudgets(harness.settings);
 
-  for (const request of requests.filter(request => shouldPersonaOwnToolRequest(systemType, request))) {
-    const allowed = hasToolPermission(harness.documents, systemType, request.toolId);
-    if (!allowed) {
+  for (const request of requests) {
+    const registryAllowed = hasToolPermission(harness.documents, systemType, request.toolId);
+    const accessKey = getToolAccessKey(request);
+    const accessMode = getToolAccessMode(harness.settings, systemType, request);
+
+    if (!registryAllowed || accessMode === 'deny') {
+      const reason = !registryAllowed
+        ? 'Permission denied by registry.tools.'
+        : `Permission denied by Tool Access Matrix (${accessKey}=DENY).`;
       toolTraces.push({
         systemName: config.name,
         toolId: request.toolId,
         status: 'denied',
-        summary: 'Permission denied by registry.tools.',
+        summary: reason,
         details: request.reason,
       });
-      emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'failed', `${request.toolId} denied by registry.tools.`);
+      emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'failed', `${request.toolId} denied: ${reason}`);
       continue;
     }
 
-    const assessment = assessToolRequestRisk(request);
+    const baseAssessment = assessToolRequestRisk(request);
+    const assessment = accessMode === 'review'
+      ? requireReviewByMatrix(request, baseAssessment, accessKey)
+      : baseAssessment;
     if (assessment.requiresApproval) {
       const pendingAction = makePendingAction(config.name, request, assessment);
       pendingActions.push(pendingAction);
@@ -1408,26 +2181,106 @@ const executeToolRequests = async (
       continue;
     }
 
+    if (request.toolId === 'web.fetch') {
+      const url = typeof request.arguments?.url === 'string' ? request.arguments.url.trim() : '';
+      if (!url) {
+        toolTraces.push({
+          systemName: config.name,
+          toolId: request.toolId,
+          status: 'skipped',
+          summary: 'Missing fetch URL.',
+          details: request.reason,
+        });
+        emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'failed', 'web.fetch skipped because URL was empty.');
+        continue;
+      }
+
+      try {
+        emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'running', `Fetching URL: ${url}`);
+        const bridgeResult = await executeBridgeTool('web.fetch', request.arguments || {}, config.name);
+        const result = bridgeResult.result as Partial<WebFetchResult> & {
+          status?: number;
+          ok?: boolean;
+          truncated?: boolean;
+        };
+        if (result.url) {
+          sources.push({
+            title: result.title || result.url,
+            uri: result.url,
+          });
+        }
+        const promptDetails = truncateForPrompt({
+          url: result.url || url,
+          status: result.status,
+          title: result.title,
+          contentType: result.contentType,
+          content: result.content || '',
+        }, budgets.toolAuditChars);
+        toolResultBlocks.push(`### ${config.name} used web.fetch\nReason: ${request.reason || 'No reason supplied.'}\nResult:\n${promptDetails}`);
+        toolTraces.push({
+          systemName: config.name,
+          toolId: request.toolId,
+          status: result.ok === false ? 'failed' : 'allowed',
+          query: result.url || url,
+          summary: request.reason || 'Persona fetched a URL.',
+          details: stringifyTraceDetails(result, budgets.traceDetailsMaxChars),
+        });
+        emitStreamEvent(
+          streamEvents,
+          onEvent,
+          'tool',
+          config.name,
+          result.ok === false ? 'failed' : 'complete',
+          result.ok === false ? `web.fetch returned HTTP ${result.status || 'error'}.` : 'web.fetch completed.',
+        );
+      } catch (error) {
+        toolTraces.push({
+          systemName: config.name,
+          toolId: request.toolId,
+          status: 'failed',
+          query: url,
+          summary: request.reason || 'Persona fetched a URL.',
+          details: error instanceof Error ? error.message : 'web.fetch failed.',
+        });
+        emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'failed', 'web.fetch failed.', error instanceof Error ? error.message : 'web.fetch failed.');
+      }
+      continue;
+    }
+
     try {
       emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'running', `Executing ${request.toolId}.`);
       const bridgeResult = await executeBridgeTool(request.toolId, request.arguments || {}, config.name);
-      const details = truncateForPrompt({
+      const bridgeFailed = bridgeResultIndicatesFailure(request, bridgeResult.result);
+      const parsedScriptJson = parseSkillScriptStdoutJson(bridgeResult.result);
+      const parsedQuoteResult = parsedScriptJson ? formatParsedQuoteResult(parsedScriptJson) : '';
+      const details = stringifyTraceDetails({
         request: request.arguments || {},
+        metadata: request.metadata || {},
+        parsed: parsedQuoteResult ? parsedScriptJson : undefined,
         result: bridgeResult.result,
-      });
+      }, budgets.traceDetailsMaxChars);
       const promptDetails = truncateForPrompt({
         request: request.arguments || {},
+        metadata: request.metadata || {},
+        parsed: parsedQuoteResult ? parsedScriptJson : undefined,
         result: bridgeResult.result,
-      }, 5000);
-      toolResultBlocks.push(`### ${config.name} used ${request.toolId}\nReason: ${request.reason || 'No reason supplied.'}\nResult:\n${promptDetails}`);
+      }, budgets.toolAuditChars);
+      toolResultBlocks.push(`### ${config.name} used ${request.toolId}\nReason: ${request.reason || 'No reason supplied.'}\n${parsedQuoteResult ? `${parsedQuoteResult}\n` : ''}Result:\n${promptDetails}`);
       toolTraces.push({
         systemName: config.name,
         toolId: request.toolId,
-        status: 'allowed',
+        status: bridgeFailed ? 'failed' : 'allowed',
         summary: request.reason || `Persona requested ${request.toolId}.`,
         details,
       });
-      emitStreamEvent(streamEvents, onEvent, 'tool', config.name, 'complete', `${request.toolId} completed.`);
+      emitStreamEvent(
+        streamEvents,
+        onEvent,
+        'tool',
+        config.name,
+        bridgeFailed ? 'failed' : 'complete',
+        bridgeFailed ? `${request.toolId} returned a failure result.` : `${request.toolId} completed.`,
+      );
     } catch (error) {
       toolTraces.push({
         systemName: config.name,
@@ -1463,6 +2316,7 @@ const queryArchetype = async (
   const config = systemConfigs[systemType];
   const client = createClient(harness.settings);
   const modelName = getModelName(harness.settings);
+  const budgets = getRuntimeBudgets(harness.settings);
   const harnessBlock = buildPersonaHarness(systemType, harness.documents, legacyMemoryStr, runtimeBlock);
   const allowedDocumentIds = new Set<HarnessDocumentId>([
     getPersonaMemoryDocumentId(systemType),
@@ -1476,7 +2330,7 @@ const queryArchetype = async (
   const pendingActions: PendingAction[] = [];
   const streamEvents: StreamEvent[] = [];
   emitStreamEvent(streamEvents, onEvent, 'tool-plan', config.name, 'running', 'Planning permitted tool usage.');
-  const toolRequests = await planPersonaTools(client, modelName, harness.settings, systemType, harnessBlock, userQuery, runtime);
+  const toolRequests = await planPersonaTools(client, modelName, harness, systemType, harnessBlock, userQuery, runtime);
   emitStreamEvent(
     streamEvents,
     onEvent,
@@ -1544,7 +2398,7 @@ User query: "${userQuery}"
       model: modelName,
       messages: [{ role: 'system', content: archetypePrompt }],
       temperature: 0.7,
-      max_tokens: 3072,
+      max_tokens: budgets.personaMaxTokens,
       response_format: { type: 'json_object' },
     }) as any);
 
@@ -1624,12 +2478,13 @@ const planCouncilTools = async (
   const config = systemConfigs[systemType];
   const client = createClient(harness.settings);
   const modelName = getModelName(harness.settings);
+  const budgets = getRuntimeBudgets(harness.settings);
   const langInstruction = language === 'CN'
     ? 'Think in Chinese.'
     : 'Think in English.';
   const ownOutput = initialOutputs[systemType];
   const toolAudit = existingToolTraces.map(trace =>
-    `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 800)}`,
+    `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', budgets.toolAuditChars)}`,
   ).join('\n') || 'NO TOOL CALLS YET.';
 
   const promptText = `
@@ -1638,6 +2493,9 @@ You are ${config.name}. The council is allowed to act while deliberating. Decide
 ${langInstruction}
 
 ${runtimeBlock}
+
+## Tool Access Matrix For ${config.name}
+${formatToolAccessForPersona(harness.settings, systemType)}
 
 ## User Query
 ${userQuery}
@@ -1654,20 +2512,28 @@ ${toolAudit}
 ${formatPendingActions(pendingActions)}
 
 Rules:
-- You have native function tools available: web_search_tavily, skill_run, mcp_call.
+- You have native function tools available: web_search_tavily, web_fetch, skill_run, mcp_call.
+- Tool calls must be permitted by both registry.tools and the Tool Access Matrix above.
 - Do not ask the user for permission to run low-risk read-only tools; call the tool now.
 - If a factual claim can be checked with an available read-only tool, call the tool.
+- Use web_search_tavily/web_fetch for retrieval-only questions. Use Browser MCP only for UI state, screenshots, DOM/page verification, or click/type interactions.
+- If the user explicitly says they do not need a browser or screenshot, do not call mcp_call with server="browser".
 - Avoid repeating a tool call that already has a useful result in Tool Audit.
 - Risky click/type/write actions may be requested, but they will enter the approval queue.
 - Return no tool calls when no additional action is useful.
 `;
 
   try {
-    const planned = await planNativeToolCalls(client, modelName, harness.settings, promptText, `${config.name} COUNCIL TOOL PLANNER`, 1);
-    return planned
-      .filter(request => shouldPersonaOwnToolRequest(systemType, request))
-      .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces))
-      .slice(0, 1);
+    const planned = annotateSkillActionRequests(filterToolRequestsForUserIntent(
+      await planNativeToolCalls(client, modelName, harness.settings, promptText, `${config.name} COUNCIL TOOL PLANNER`, budgets.councilToolMaxRequests),
+      userQuery,
+    ), runtime, userQuery);
+    return prioritizeToolRequestsForUserIntent(planned
+      .filter(request => canPersonaRequestTool(harness, systemType, request))
+      .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces, userQuery)),
+      userQuery,
+    )
+      .slice(0, budgets.councilToolMaxRequests);
   } catch (error) {
     console.warn(`[${config.name}] Council tool-planning step failed.`, error);
     return [];
@@ -1678,6 +2544,7 @@ const planSynthesisTools = async (
   userQuery: string,
   language: Language,
   harness: MagiHarnessContext,
+  runtime: RuntimeCapabilities,
   runtimeBlock: string,
   initialOutputs: Record<MagiSystem, MagiAnalysis>,
   meeting: CouncilExchange[],
@@ -1686,6 +2553,7 @@ const planSynthesisTools = async (
 ): Promise<PlannedToolRequest[]> => {
   const client = createClient(harness.settings);
   const modelName = getModelName(harness.settings);
+  const budgets = getRuntimeBudgets(harness.settings);
   const langInstruction = language === 'CN'
     ? 'Think in Chinese.'
     : 'Think in English.';
@@ -1694,7 +2562,7 @@ const planSynthesisTools = async (
     return `[${output.systemName}]\nAnalysis: ${output.analysis}\nProposal: ${output.proposal}\nVote: ${output.vote ? 'APPROVE' : 'REJECT'}`;
   }).join('\n\n');
   const toolAudit = existingToolTraces.map(trace =>
-    `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 900)}`,
+    `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', budgets.toolAuditChars)}`,
   ).join('\n') || 'NO TOOL CALLS YET.';
 
   const promptText = `
@@ -1703,6 +2571,12 @@ You are the MAGI council integrator immediately before final synthesis. The coun
 ${langInstruction}
 
 ${runtimeBlock}
+
+## Tool Access Matrix
+${Object.values(MagiSystem).map(systemType => {
+    const matrix = normalizeToolAccessMatrix(harness.settings.toolAccess)[systemType];
+    return `### ${systemType}\n${TOOL_ACCESS_DEFINITIONS.map(definition => `- ${definition.key}: ${matrix[definition.key]}`).join('\n')}`;
+  }).join('\n\n')}
 
 ## User Query
 ${userQuery}
@@ -1720,19 +2594,28 @@ ${toolAudit}
 ${formatPendingActions(pendingActions)}
 
 Rules:
-- You have native function tools available: web_search_tavily, skill_run, mcp_call.
+- You have native function tools available: web_search_tavily, web_fetch, skill_run, mcp_call.
+- Tool calls must be permitted by registry.tools and at least one persona row in the Tool Access Matrix.
 - This is the final pre-answer action checkpoint. If a permitted tool can settle a remaining factual, file, browser, skill, or MCP uncertainty, request it now.
 - Do not ask the user for permission to run low-risk read-only tools. Call them.
+- Use web_search_tavily/web_fetch for retrieval-only questions. Use Browser MCP only for UI state, screenshots, DOM/page verification, or click/type interactions.
+- If the user explicitly says they do not need a browser or screenshot, do not call mcp_call with server="browser".
 - Avoid repeating useful tool calls already present in Tool Audit.
 - Risky click/type/write/execute actions may be requested, but they will become pending approvals.
 - Return no tool calls when the answer can already be grounded in existing tool results.
 `;
 
   try {
-    const planned = await planNativeToolCalls(client, modelName, harness.settings, promptText, 'SYNTHESIS TOOL PLANNER', 2);
-    return planned
-      .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces))
-      .slice(0, 2);
+    const planned = annotateSkillActionRequests(filterToolRequestsForUserIntent(
+      await planNativeToolCalls(client, modelName, harness.settings, promptText, 'SYNTHESIS TOOL PLANNER', budgets.synthesisToolMaxRequests),
+      userQuery,
+    ), runtime, userQuery);
+    return prioritizeToolRequestsForUserIntent(planned
+      .filter(request => Object.values(MagiSystem).some(systemType => canPersonaRequestTool(harness, systemType, request)))
+      .filter(request => !toolRequestAlreadyAttempted(request, existingToolTraces, userQuery)),
+      userQuery,
+    )
+      .slice(0, budgets.synthesisToolMaxRequests);
   } catch (error) {
     console.warn('[COUNCIL] Synthesis tool-planning step failed.', error);
     return [];
@@ -1754,6 +2637,7 @@ const queryCouncilExchange = async (
   const config = systemConfigs[systemType];
   const client = createClient(harness.settings);
   const modelName = getModelName(harness.settings);
+  const budgets = getRuntimeBudgets(harness.settings);
   const streamEvents: StreamEvent[] = [];
   const langInstruction = language === 'CN'
     ? 'Output all user-facing content in Simplified Chinese.'
@@ -1799,7 +2683,7 @@ ${otherOutputs}
 ${formatPendingActions(pendingActions)}
 
 ## Tool Audit So Far
-${toolAudit.map(trace => `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 900)}`).join('\n') || 'NO TOOL CALLS.'}
+${toolAudit.map(trace => `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', budgets.toolAuditChars)}`).join('\n') || 'NO TOOL CALLS.'}
 
 Respond to the other two personas and the tool results. Challenge weak assumptions, name blocked actions, and revise your proposal if needed.
 Do not ask the user to approve low-risk read-only work that already executed or could have executed. Ask clarification only for genuinely missing intent, credentials, destructive changes, or pending approval.
@@ -1839,7 +2723,7 @@ Return JSON only:
               : `${promptText}\n\nRetry instruction: return a compact valid JSON object only. Keep content and revisedProposal short.`,
           }],
           temperature: attempt === 0 ? 0.6 : 0.2,
-          max_tokens: attempt === 0 ? 4096 : 2048,
+          max_tokens: attempt === 0 ? budgets.meetingMaxTokens : budgets.meetingRetryMaxTokens,
           response_format: { type: 'json_object' },
         }) as any);
 
@@ -1911,6 +2795,7 @@ const streamFinalSynthesis = async (
   },
   meeting: CouncilExchange[],
   pendingActions: PendingAction[],
+  toolTraces: ToolTrace[],
   fallback: string,
   emit: (
     phase: string,
@@ -1922,6 +2807,7 @@ const streamFinalSynthesis = async (
   onTextDelta?: QueryMagiOptions['onTextDelta'],
 ) => {
   let fullText = '';
+  const budgets = getRuntimeBudgets(harness.settings);
   const langInstruction = language === 'CN'
     ? 'Output in Simplified Chinese.'
     : 'Output in English.';
@@ -1947,11 +2833,16 @@ ${formatMeetingTranscript(meeting)}
 ## Pending Actions
 ${formatPendingActions(pendingActions)}
 
+## Tool Audit
+${toolTraces.map(trace => `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', budgets.toolAuditChars)}`).join('\n') || 'NO TOOL CALLS.'}
+
 Rules:
 - Be concise and concrete.
 - Lead with the answer or completed action result, not the council process.
 - If pending actions require approval, clearly say they are waiting and do not claim they have executed.
 - If user input is required, ask the focused question(s) implied by the draft; do not ask for confirmation to run low-risk tools that already ran.
+- For market quotes, do not call a price current/real-time unless the tool audit contains a fresh source timestamp or recent quoteTime. If provider scripts/fetch failed, were rate-limited, returned freshness unknown/stale, or only old search snippets are available, say live quote retrieval failed and avoid presenting an old numeric price as current.
+- If tool audit includes parsed quote JSON, copy the numeric price/source/quoteTime/freshness exactly from that JSON, even if the draft synthesis says something different.
 - If the user requested an exact marker, token, phrase, or output sentinel, include it verbatim and do not paraphrase it.
 - Preserve the substance of the structured council result.
 `;
@@ -1963,7 +2854,7 @@ Rules:
       model: modelName,
       messages: [{ role: 'system', content: promptText }],
       temperature: 0.5,
-      max_tokens: 2048,
+      max_tokens: budgets.finalStreamMaxTokens,
       stream: true,
     }) as any);
 
@@ -1999,6 +2890,7 @@ export const queryMagiSystem = async (
 ): Promise<MagiResponse> => {
   const streamEvents: StreamEvent[] = [];
   const runId = options.runId || makeId('run');
+  const budgets = getRuntimeBudgets(harness.settings);
   const emit = (
     phase: string,
     actor: string,
@@ -2018,7 +2910,7 @@ export const queryMagiSystem = async (
       'runtime',
       'HARNESS',
       'complete',
-      `Model ${harness.settings.modelName || process.env.OPENAI_MODEL_NAME || 'unset'}; reasoning ${harness.settings.reasoningEnabled ? harness.settings.reasoningEffort : 'off'}.`,
+      `Model ${harness.settings.modelName || process.env.OPENAI_MODEL_NAME || 'unset'}; reasoning ${harness.settings.reasoningEnabled ? harness.settings.reasoningEffort : 'off'}; persona timeout ${budgets.personaTimeoutMs}ms.`,
     ),
     makeTraceStep(
       'context',
@@ -2032,7 +2924,7 @@ export const queryMagiSystem = async (
     'runtime',
     'HARNESS',
     'complete',
-    `Model ${harness.settings.modelName || process.env.OPENAI_MODEL_NAME || 'unset'}; reasoning ${harness.settings.reasoningEnabled ? harness.settings.reasoningEffort : 'off'}.`,
+    `Model ${harness.settings.modelName || process.env.OPENAI_MODEL_NAME || 'unset'}; reasoning ${harness.settings.reasoningEnabled ? harness.settings.reasoningEffort : 'off'}; budgets persona=${budgets.personaMaxTokens}, synthesis=${budgets.synthesisMaxTokens}, tools=${budgets.initialToolMaxRequests}/${budgets.councilToolMaxRequests}/${budgets.synthesisToolMaxRequests}.`,
   );
 
   const client = createClient(harness.settings);
@@ -2068,7 +2960,7 @@ export const queryMagiSystem = async (
           streamEvents.push(event);
           options.onEvent?.(event);
         }),
-        60000,
+        budgets.personaTimeoutMs,
       );
     } catch (error) {
       console.error(`Timed out or failed: ${systemType}`, error);
@@ -2225,6 +3117,7 @@ export const queryMagiSystem = async (
     prompt,
     language,
     harness,
+    runtime,
     runtimeBlock,
     initialOutputs,
     meeting,
@@ -2232,7 +3125,7 @@ export const queryMagiSystem = async (
     pendingActions,
   );
   const synthesisToolExecutions = await Promise.all(synthesisToolRequests.map(async request => {
-    const owner = getToolRequestOwner(request);
+    const owner = getToolRequestOwner(request, harness);
     return {
       owner,
       result: await executeToolRequests([request], owner, harness, event => {
@@ -2325,7 +3218,7 @@ ${formatMeetingTranscript(meeting)}
 ${formatPendingActions(pendingActions)}
 
 ## Tool Audit
-${allToolTraces.map(trace => `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', 1200)}`).join('\n') || 'NO TOOL CALLS.'}
+${allToolTraces.map(trace => `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', budgets.toolAuditChars)}`).join('\n') || 'NO TOOL CALLS.'}
 
 Return JSON only:
 {
@@ -2350,6 +3243,9 @@ If the pending action queue is not empty, do not claim those actions have execut
 If low-risk read-only tools have already run, answer from their results instead of asking whether to run them.
 If the next safe step depends on genuinely missing user intent, credentials, destructive changes, or a risky action approval, set requiresUserInput true and ask focused questions.
 If runtime bridge is online and filesystem MCP tools are listed, do not say the system cannot inspect local files. Instead summarize tool results or state which mcp.call should be approved/executed next.
+For market quote tasks, the source quote timestamp controls wording. If quote data is absent, stale, older than the current/latest trading session, or only from an old search snippet, do not call it "current", "real-time", or "实时"; state the shown timestamp and write "报价新鲜度: 未确认" or "stale".
+For tool results containing "Parsed quote result", copy the numeric price, source, quoteTime, currency, and freshness exactly from that parsed block. Do not substitute remembered prices, search snippets, or approximate market values.
+If all live quote routes failed, were rate-limited, or only returned dated snippets, say that live quote retrieval failed. Do not present a numeric price from an old search result as the current price.
 If the user requested an exact marker, token, phrase, or output sentinel, preserve it verbatim in synthesis.
 `;
 
@@ -2358,7 +3254,7 @@ If the user requested an exact marker, token, phrase, or output sentinel, preser
     model: modelName,
     messages: [{ role: 'system', content: synthesisPrompt }],
     temperature: 0.7,
-    max_tokens: 8192,
+    max_tokens: budgets.synthesisMaxTokens,
     response_format: { type: 'json_object' },
   }) as any);
 
@@ -2412,6 +3308,7 @@ If the user requested an exact marker, token, phrase, or output sentinel, preser
     { ...synthesisResult, requiresUserInput },
     meeting,
     pendingActions,
+    allToolTraces,
     fallbackSynthesis,
     emit,
     options.onTextDelta,

@@ -1,10 +1,11 @@
-import { AuditEvent } from '../types';
+import { AuditEvent, SkillActionManifest } from '../types';
 
 export interface BridgeSkill {
   id: string;
   name: string;
   description: string;
   dir: string;
+  actions?: SkillActionManifest[];
 }
 
 export interface BridgeStatus {
@@ -65,7 +66,7 @@ export const getBridgeStatus = async (): Promise<BridgeStatus> => {
 };
 
 export const executeBridgeTool = async (
-  toolId: 'skill.run' | 'mcp.call',
+  toolId: 'web.fetch' | 'skill.run' | 'mcp.call',
   args: Record<string, unknown>,
   actor = 'HARNESS',
 ): Promise<BridgeToolResult> => {

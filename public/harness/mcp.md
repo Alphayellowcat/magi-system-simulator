@@ -26,6 +26,18 @@ github: configurable
 openai-docs: configurable
 ```
 
+## Browser MCP Scope
+
+Browser MCP is an execution adapter for real browser state. Use it for:
+
+- local UI inspection and page verification
+- current page DOM/text checks
+- screenshots and visual layout evidence
+- streaming output verification
+- click/type/form workflows that need approval
+
+Do not use Browser MCP for retrieval-only questions such as weather, news, search, factual lookup, documentation discovery, or reading a known public URL. Those belong to `web.search.tavily` and `web.fetch`.
+
 ## Execution Gate
 
 Before executing an MCP call, the harness should know:

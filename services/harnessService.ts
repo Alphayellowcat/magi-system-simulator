@@ -6,6 +6,11 @@ import {
   HarnessSettings,
   MagiSystem,
   ReasoningEffort,
+  RuntimeBudgetSettings,
+  ToolAccessDefinition,
+  ToolAccessKey,
+  ToolAccessMatrix,
+  ToolAccessMode,
 } from '../types';
 import { loadLocalState, saveLocalState } from './stateStorageService';
 
@@ -68,7 +73,7 @@ export const HARNESS_DOCUMENT_DEFINITIONS: HarnessDocumentDefinition[] = [
     id: 'registry.tools',
     label: 'Tool Registry',
     path: '/harness/tools.md',
-    fallback: '# Tool Registry\n\n```permissions\nMELCHIOR-1:web.search.tavily=allow\nBALTHASAR-2:web.search.tavily=allow\nCASPER-3:web.search.tavily=allow\n```',
+    fallback: '# Tool Registry\n\n```permissions\nMELCHIOR-1:web.search.tavily=allow\nMELCHIOR-1:web.fetch=allow\nBALTHASAR-2:web.search.tavily=allow\nBALTHASAR-2:web.fetch=allow\nCASPER-3:web.search.tavily=allow\nCASPER-3:web.fetch=allow\n```',
   },
   {
     id: 'registry.skills',
@@ -87,6 +92,142 @@ export const HARNESS_DOCUMENT_DEFINITIONS: HarnessDocumentDefinition[] = [
 const isReasoningEffort = (value: unknown): value is ReasoningEffort =>
   value === 'low' || value === 'medium' || value === 'high';
 
+export const DEFAULT_RUNTIME_BUDGETS: RuntimeBudgetSettings = {
+  personaTimeoutMs: 300000,
+  plannerMaxTokens: 4096,
+  personaMaxTokens: 16384,
+  meetingMaxTokens: 8192,
+  meetingRetryMaxTokens: 4096,
+  synthesisMaxTokens: 32768,
+  finalStreamMaxTokens: 8192,
+  initialToolMaxRequests: 6,
+  councilToolMaxRequests: 3,
+  synthesisToolMaxRequests: 4,
+  runtimeSuggestMaxRequests: 8,
+  toolAuditChars: 4000,
+  traceDetailsMaxChars: 50000,
+};
+
+const clampNumber = (value: unknown, fallback: number, min: number, max: number) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(numeric)));
+};
+
+export const normalizeRuntimeBudgets = (budgets?: Partial<RuntimeBudgetSettings> | null): RuntimeBudgetSettings => ({
+  personaTimeoutMs: clampNumber(budgets?.personaTimeoutMs, DEFAULT_RUNTIME_BUDGETS.personaTimeoutMs, 30000, 900000),
+  plannerMaxTokens: clampNumber(budgets?.plannerMaxTokens, DEFAULT_RUNTIME_BUDGETS.plannerMaxTokens, 512, 32768),
+  personaMaxTokens: clampNumber(budgets?.personaMaxTokens, DEFAULT_RUNTIME_BUDGETS.personaMaxTokens, 1024, 65536),
+  meetingMaxTokens: clampNumber(budgets?.meetingMaxTokens, DEFAULT_RUNTIME_BUDGETS.meetingMaxTokens, 1024, 65536),
+  meetingRetryMaxTokens: clampNumber(budgets?.meetingRetryMaxTokens, DEFAULT_RUNTIME_BUDGETS.meetingRetryMaxTokens, 512, 32768),
+  synthesisMaxTokens: clampNumber(budgets?.synthesisMaxTokens, DEFAULT_RUNTIME_BUDGETS.synthesisMaxTokens, 2048, 131072),
+  finalStreamMaxTokens: clampNumber(budgets?.finalStreamMaxTokens, DEFAULT_RUNTIME_BUDGETS.finalStreamMaxTokens, 1024, 65536),
+  initialToolMaxRequests: clampNumber(budgets?.initialToolMaxRequests, DEFAULT_RUNTIME_BUDGETS.initialToolMaxRequests, 1, 16),
+  councilToolMaxRequests: clampNumber(budgets?.councilToolMaxRequests, DEFAULT_RUNTIME_BUDGETS.councilToolMaxRequests, 0, 12),
+  synthesisToolMaxRequests: clampNumber(budgets?.synthesisToolMaxRequests, DEFAULT_RUNTIME_BUDGETS.synthesisToolMaxRequests, 0, 12),
+  runtimeSuggestMaxRequests: clampNumber(budgets?.runtimeSuggestMaxRequests, DEFAULT_RUNTIME_BUDGETS.runtimeSuggestMaxRequests, 1, 24),
+  toolAuditChars: clampNumber(budgets?.toolAuditChars, DEFAULT_RUNTIME_BUDGETS.toolAuditChars, 800, 20000),
+  traceDetailsMaxChars: clampNumber(budgets?.traceDetailsMaxChars, DEFAULT_RUNTIME_BUDGETS.traceDetailsMaxChars, 4000, 200000),
+});
+
+const systemTypes = [MagiSystem.MELCHIOR, MagiSystem.BALTHASAR, MagiSystem.CASPER] as const;
+
+export const TOOL_ACCESS_DEFINITIONS: ToolAccessDefinition[] = [
+  {
+    key: 'web.search.tavily',
+    label: 'Web Search',
+    description: 'Read-only Tavily web search.',
+  },
+  {
+    key: 'web.fetch',
+    label: 'Web Fetch',
+    description: 'Read a specific URL without opening a browser.',
+  },
+  {
+    key: 'skill.run.load',
+    label: 'Skill Load',
+    description: 'Load SKILL.md instructions and metadata.',
+  },
+  {
+    key: 'skill.run.script',
+    label: 'Skill Script',
+    description: 'Run an approved local skill script.',
+  },
+  {
+    key: 'mcp.filesystem.read',
+    label: 'Filesystem Read',
+    description: 'Read/list/search files through filesystem MCP.',
+  },
+  {
+    key: 'mcp.filesystem.write',
+    label: 'Filesystem Write',
+    description: 'Create/edit/delete files through filesystem MCP.',
+  },
+  {
+    key: 'mcp.browser.read',
+    label: 'Browser Read',
+    description: 'Navigate/read/screenshot/close through Browser MCP.',
+  },
+  {
+    key: 'mcp.browser.interact',
+    label: 'Browser Interact',
+    description: 'Click/type/fill/submit through Browser MCP.',
+  },
+  {
+    key: 'mcp.other.read',
+    label: 'Other MCP Read',
+    description: 'Read-only calls on non-core MCP servers.',
+  },
+  {
+    key: 'mcp.other.write',
+    label: 'Other MCP Write',
+    description: 'Mutating or ambiguous calls on non-core MCP servers.',
+  },
+];
+
+const toolAccessKeys = TOOL_ACCESS_DEFINITIONS.map(definition => definition.key);
+
+const isToolAccessMode = (value: unknown): value is ToolAccessMode =>
+  value === 'allow' || value === 'review' || value === 'deny';
+
+const isToolAccessKey = (value: unknown): value is ToolAccessKey =>
+  typeof value === 'string' && toolAccessKeys.includes(value as ToolAccessKey);
+
+export const createDefaultToolAccessMatrix = (): ToolAccessMatrix =>
+  systemTypes.reduce((matrix, systemType) => {
+    matrix[systemType] = {
+      'web.search.tavily': 'allow',
+      'web.fetch': 'allow',
+      'skill.run.load': 'allow',
+      'skill.run.script': 'review',
+      'mcp.filesystem.read': 'allow',
+      'mcp.filesystem.write': 'review',
+      'mcp.browser.read': 'allow',
+      'mcp.browser.interact': 'review',
+      'mcp.other.read': 'review',
+      'mcp.other.write': 'review',
+    };
+    return matrix;
+  }, {} as ToolAccessMatrix);
+
+export const normalizeToolAccessMatrix = (rawMatrix?: Partial<ToolAccessMatrix> | null): ToolAccessMatrix => {
+  const defaults = createDefaultToolAccessMatrix();
+  if (!rawMatrix || typeof rawMatrix !== 'object') return defaults;
+
+  systemTypes.forEach(systemType => {
+    const rawRow = rawMatrix[systemType];
+    if (!rawRow || typeof rawRow !== 'object') return;
+
+    Object.entries(rawRow).forEach(([key, mode]) => {
+      if (isToolAccessKey(key) && isToolAccessMode(mode)) {
+        defaults[systemType][key] = mode;
+      }
+    });
+  });
+
+  return defaults;
+};
+
 export const createDefaultHarnessSettings = (): HarnessSettings => ({
   apiKey: '',
   baseURL: process.env.OPENAI_BASE_URL || '',
@@ -94,22 +235,32 @@ export const createDefaultHarnessSettings = (): HarnessSettings => ({
   tavilyApiKey: '',
   reasoningEnabled: false,
   reasoningEffort: 'medium',
+  runtimeBudgets: DEFAULT_RUNTIME_BUDGETS,
+  toolAccess: createDefaultToolAccessMatrix(),
 });
+
+export const normalizeHarnessSettings = (settings?: Partial<HarnessSettings> | null): HarnessSettings => {
+  const defaults = createDefaultHarnessSettings();
+  if (!settings || typeof settings !== 'object') return defaults;
+
+  return {
+    ...defaults,
+    ...settings,
+    reasoningEffort: isReasoningEffort(settings.reasoningEffort)
+      ? settings.reasoningEffort
+      : defaults.reasoningEffort,
+    runtimeBudgets: normalizeRuntimeBudgets(settings.runtimeBudgets),
+    toolAccess: normalizeToolAccessMatrix(settings.toolAccess),
+  };
+};
 
 export const loadHarnessSettings = (): HarnessSettings => {
   if (typeof localStorage !== 'undefined') {
     LEGACY_SETTINGS_KEYS.forEach(key => localStorage.removeItem(key));
   }
 
-  const defaults = createDefaultHarnessSettings();
   const saved = loadLocalState<Partial<HarnessSettings> | null>('settings', null);
-  if (!saved) return defaults;
-
-  return {
-    ...defaults,
-    ...saved,
-    reasoningEffort: isReasoningEffort(saved.reasoningEffort) ? saved.reasoningEffort : defaults.reasoningEffort,
-  };
+  return normalizeHarnessSettings(saved);
 };
 
 export const saveHarnessSettings = (settings: HarnessSettings) => {
@@ -224,10 +375,16 @@ export const getPersonaMemoryDocumentId = (systemType: MagiSystem): HarnessDocum
 
 export const hasToolPermission = (documents: HarnessDocuments, systemType: MagiSystem, toolId: string) => {
   const registry = documents['registry.tools']?.content || '';
-  const escapedTool = toolId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const escapedSystem = systemType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`${escapedSystem}\\s*:\\s*${escapedTool}\\s*=\\s*allow`, 'i');
-  return pattern.test(registry);
+  const hasExplicitPermission = (candidateToolId: string) => {
+    const escapedTool = candidateToolId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escapedSystem = systemType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`${escapedSystem}\\s*:\\s*${escapedTool}\\s*=\\s*allow`, 'i');
+    return pattern.test(registry);
+  };
+
+  if (hasExplicitPermission(toolId)) return true;
+  if (toolId === 'web.fetch') return hasExplicitPermission('web.search.tavily');
+  return false;
 };
 
 export const applyDocumentOperations = (

@@ -20,6 +20,7 @@ interface SkillInfo {
   description: string;
   dir: string;
   skillPath: string;
+  actions?: unknown[];
 }
 
 interface McpServerConfig {
@@ -37,7 +38,7 @@ interface McpConfig {
 }
 
 interface ToolExecutionInput {
-  toolId: 'skill.run' | 'mcp.call';
+  toolId: 'web.fetch' | 'skill.run' | 'mcp.call';
   actor?: string;
   arguments?: Record<string, unknown>;
 }
@@ -237,6 +238,22 @@ const parseFrontMatterValue = (content: string, key: string) => {
   return line.slice(line.indexOf(':') + 1).trim().replace(/^['"]|['"]$/g, '');
 };
 
+const readSkillActions = async (dir: string) => {
+  const actionPath = path.join(dir, 'actions.json');
+  try {
+    const raw = await fs.readFile(actionPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return [];
+    if (Array.isArray(parsed)) return parsed;
+    const actions = (parsed as { actions?: unknown }).actions;
+    return Array.isArray(actions) ? actions : [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    console.warn(`Failed to read skill actions from ${actionPath}:`, error);
+    return [];
+  }
+};
+
 const listSkillFiles = async (dir: string, depth: number, found: string[] = []): Promise<string[]> => {
   if (depth < 0) return found;
 
@@ -293,11 +310,12 @@ const scanSkills = async (root: string, bridgeConfig: BridgeConfig) => {
     const content = await fs.readFile(skillPath, 'utf8');
     const name = parseFrontMatterValue(content, 'name') || path.basename(dir);
     const description = parseFrontMatterValue(content, 'description');
+    const actions = await readSkillActions(dir);
     const id = normalizeId(name);
     const uniqueKey = `${id}:${dir}`;
     if (seen.has(uniqueKey)) continue;
     seen.add(uniqueKey);
-    skills.push({ id, name, description, dir, skillPath });
+    skills.push({ id, name, description, dir, skillPath, actions });
   }
 
   return skills.sort((a, b) => a.name.localeCompare(b.name));
@@ -365,7 +383,7 @@ const runSkill = async (
 
   const result = await runCommand(command, commandArgs, {
     cwd: skill.dir,
-    timeoutMs: bridgeConfig.commandTimeoutMs || 30000,
+    timeoutMs: bridgeConfig.commandTimeoutMs || 120000,
   });
 
   return {
@@ -413,12 +431,70 @@ const runCommand = (
   child.on('close', code => {
     clearTimeout(timer);
     resolve({
-      stdout: stdout.slice(-20000),
-      stderr: stderr.slice(-20000),
+      stdout: stdout.slice(-100000),
+      stderr: stderr.slice(-100000),
       exitCode: code,
     });
   });
 });
+
+const decodeHtmlEntities = (value: string) => value
+  .replace(/&nbsp;/g, ' ')
+  .replace(/&amp;/g, '&')
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  .replace(/&quot;/g, '"')
+  .replace(/&#39;/g, "'");
+
+const htmlToReadableText = (html: string) => decodeHtmlEntities(html
+  .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+  .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+  .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+  .replace(/<[^>]+>/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim());
+
+const runWebFetch = async (args: Record<string, unknown>) => {
+  const url = typeof args.url === 'string' ? args.url.trim() : '';
+  if (!url) throw new Error('web.fetch requires arguments.url');
+
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('web.fetch only supports http and https URLs.');
+  }
+
+  const maxChars = Math.max(1000, Math.min(200000, Number(args.maxChars || 60000)));
+  const response = await fetch(parsed.toString(), {
+    headers: {
+      Accept: 'text/html, text/plain, application/json;q=0.8, */*;q=0.5',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      'User-Agent': 'MAGI-Harness/0.8 (+local verification)',
+    },
+    redirect: 'follow',
+  });
+
+  const contentType = response.headers.get('content-type') || '';
+  const raw = await response.text();
+  const title = contentType.includes('text/html')
+    ? decodeHtmlEntities(raw.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || '')
+    : '';
+  const content = contentType.includes('text/html')
+    ? htmlToReadableText(raw)
+    : raw.replace(/\s+/g, ' ').trim();
+
+  return {
+    type: 'web',
+    action: 'fetch',
+    ok: response.ok,
+    status: response.status,
+    url: response.url,
+    title,
+    contentType,
+    content: content.slice(0, maxChars),
+    truncated: content.length > maxChars,
+  };
+};
 
 class StdioMcpClient {
   private child: ReturnType<typeof spawn>;
@@ -443,7 +519,7 @@ class StdioMcpClient {
     this.child.stdout.on('data', chunk => this.handleStdout(chunk.toString('utf8')));
     this.child.stderr.on('data', chunk => {
       this.stderr += chunk.toString('utf8');
-      this.stderr = this.stderr.slice(-20000);
+      this.stderr = this.stderr.slice(-100000);
     });
     this.child.on('error', error => this.rejectAll(error));
     this.child.on('close', code => this.rejectAll(new Error(`MCP server exited with code ${code}. ${this.stderr}`)));
@@ -478,7 +554,7 @@ class StdioMcpClient {
 
   private request(method: string, params: Record<string, unknown>) {
     const id = this.nextId++;
-    const timeoutMs = this.server.timeoutMs || 30000;
+    const timeoutMs = this.server.timeoutMs || 120000;
     const message = {
       jsonrpc: '2.0',
       id,
@@ -717,6 +793,10 @@ const executeTool = async (
   input: ToolExecutionInput,
   stdioClients?: Map<string, StdioMcpClient>,
 ) => {
+  if (input.toolId === 'web.fetch') {
+    return runWebFetch(input.arguments || {});
+  }
+
   if (input.toolId === 'skill.run') {
     return runSkill(root, bridgeConfig, input.arguments || {});
   }
@@ -777,6 +857,7 @@ export const harnessBridgePlugin = (root: string): Plugin => ({
               name: skill.name,
               description: skill.description,
               dir: skill.dir,
+              actions: skill.actions || [],
             })),
             mcpServers: Object.keys(mcpConfig.servers || {}),
           });

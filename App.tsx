@@ -10,6 +10,7 @@ import {
   loadHarnessDocuments,
   loadHarnessSettings,
   normalizeHarnessDocuments,
+  normalizeHarnessSettings,
   saveHarnessDocuments,
   saveHarnessSettings,
 } from './services/harnessService';
@@ -84,7 +85,7 @@ const App: React.FC = () => {
       if (cancelled) return;
       setSessions(sessionState.value);
       setMemories(memoryState.value);
-      setHarnessSettings(settingsState.value);
+      setHarnessSettings(normalizeHarnessSettings(settingsState.value));
       setHarnessDocuments(normalizeHarnessDocuments(documentState.value));
       setHarnessReady(true);
     };
@@ -196,7 +197,7 @@ const App: React.FC = () => {
   };
 
   const saveRuntimeSettings = (settings: HarnessSettings) => {
-    setHarnessSettings(settings);
+    setHarnessSettings(normalizeHarnessSettings(settings));
     setNotification('RUNTIME CONFIG SAVED');
   };
 
@@ -364,7 +365,7 @@ const App: React.FC = () => {
     const messageData = findMagiData(messageId);
     if (!action || action.status !== 'pending') return;
 
-    if (action.toolId !== 'skill.run' && action.toolId !== 'mcp.call') {
+    if (action.toolId !== 'web.fetch' && action.toolId !== 'skill.run' && action.toolId !== 'mcp.call') {
       const event = makeUiEvent('approval', action.actor, 'failed', `${action.toolId} cannot be executed by the local bridge.`);
       updatePendingAction(messageId, actionId, current => ({
         ...current,

@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "magi:cli": "node scripts/magi-cli.mjs run",
     "magi:status": "node scripts/magi-cli.mjs status",
+    "magi:matrix": "node scripts/magi-cli.mjs matrix",
     "magi:smoke": "node scripts/magi-cli.mjs smoke --bridge-only",
     "magi:smoke:full": "node scripts/magi-cli.mjs smoke --full"
   },

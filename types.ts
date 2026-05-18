@@ -6,6 +6,60 @@ export enum MagiSystem {
 
 export type Language = 'EN' | 'CN';
 export type ReasoningEffort = 'low' | 'medium' | 'high';
+export type ToolAccessMode = 'allow' | 'review' | 'deny';
+export type ToolAccessKey =
+  | 'web.search.tavily'
+  | 'web.fetch'
+  | 'skill.run.load'
+  | 'skill.run.script'
+  | 'mcp.filesystem.read'
+  | 'mcp.filesystem.write'
+  | 'mcp.browser.read'
+  | 'mcp.browser.interact'
+  | 'mcp.other.read'
+  | 'mcp.other.write';
+
+export type ToolAccessMatrix = Record<MagiSystem, Record<ToolAccessKey, ToolAccessMode>>;
+
+export interface ToolAccessDefinition {
+  key: ToolAccessKey;
+  label: string;
+  description: string;
+}
+
+export interface SkillActionArgumentTemplate {
+  from?: 'extracted_symbol' | 'literal';
+  value?: string;
+}
+
+export interface SkillActionSymbolRule {
+  patterns?: string[];
+  aliases?: Record<string, string>;
+  normalizeSuffixes?: Record<string, string>;
+  blockedWords?: string[];
+  contextualPrefixes?: string[];
+}
+
+export interface SkillActionManifest {
+  id: string;
+  description?: string;
+  toolId: ToolId;
+  mode?: string;
+  script?: string;
+  args?: SkillActionArgumentTemplate[];
+  triggers?: string[];
+  requiresAnyTrigger?: boolean;
+  symbol?: SkillActionSymbolRule;
+  risk?: PendingActionRisk;
+  readOnly?: boolean;
+  preferredOwner?: MagiSystem;
+  dedupe?: {
+    key?: string;
+    symbolArg?: boolean;
+    skipFallbackToolsOnSuccess?: boolean;
+  };
+}
+
 export type HarnessDocumentId =
   | 'persona.melchior'
   | 'persona.balthasar'
@@ -28,6 +82,24 @@ export interface HarnessSettings {
   tavilyApiKey: string;
   reasoningEnabled: boolean;
   reasoningEffort: ReasoningEffort;
+  runtimeBudgets: RuntimeBudgetSettings;
+  toolAccess: ToolAccessMatrix;
+}
+
+export interface RuntimeBudgetSettings {
+  personaTimeoutMs: number;
+  plannerMaxTokens: number;
+  personaMaxTokens: number;
+  meetingMaxTokens: number;
+  meetingRetryMaxTokens: number;
+  synthesisMaxTokens: number;
+  finalStreamMaxTokens: number;
+  initialToolMaxRequests: number;
+  councilToolMaxRequests: number;
+  synthesisToolMaxRequests: number;
+  runtimeSuggestMaxRequests: number;
+  toolAuditChars: number;
+  traceDetailsMaxChars: number;
 }
 
 export interface HarnessDocument {
@@ -65,7 +137,7 @@ export interface SessionTraceStep {
   details?: string;
 }
 
-export type ToolId = 'web.search.tavily' | 'skill.run' | 'mcp.call';
+export type ToolId = 'web.search.tavily' | 'web.fetch' | 'skill.run' | 'mcp.call';
 export type PendingActionRisk = 'low' | 'medium' | 'high';
 export type PendingActionStatus = 'pending' | 'approved' | 'rejected' | 'executing' | 'executed' | 'failed';
 
