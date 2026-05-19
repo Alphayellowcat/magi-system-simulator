@@ -25,22 +25,25 @@ Use this skill when the user needs information from the web, not interaction wit
 
 - Use `web.search.tavily` when the task needs discovery: weather, news, current facts, search results, source finding, or "look up" requests.
 - Use `web.fetch` when the task names a specific HTTP(S) URL and needs readable page text.
+- For judgment, policy, safety, academic, legal, medical, financial, or "is this reasonable" questions, search first and then fetch 1-3 authoritative or primary-looking result URLs when available. Do not rely only on snippets if the final answer makes a normative or factual reliability claim.
+- Prefer official institutions, primary documentation, universities, journals, major news outlets, or standards bodies over SEO blogs and content farms. If search results are mostly low-quality, say so and qualify the answer.
 - Use Browser MCP only when the task explicitly needs real browser state: local UI inspection, current DOM, screenshots, click/type interaction, streaming UI verification, or visual layout checks.
 - If the user says "no browser", "no screenshot", "不需要浏览器", or "不需要截图", treat that as a hard routing signal for web retrieval tools.
 
 ## Implementation Route
 
 - Request native `tool_calls`: `web_search_tavily` for discovery and `web_fetch` for known URL extraction.
-- Keep calls small: one focused query or one direct URL fetch first.
+- Keep calls staged: one or more focused search queries for discovery, then direct fetches for the best sources when the answer needs evidence stronger than snippets.
 - Use the runtime clock for relative dates such as today, tomorrow, or yesterday.
 - Include source URLs in the final answer when available.
 
 ## Workflow
 
 1. Decide whether the task is search/discovery or direct URL extraction.
-2. Request the smallest useful call: one focused search query or one direct URL fetch.
-3. Summarize the answer from retrieved content and include source URLs when available.
-4. If a page cannot be fetched but the user needs rendered UI state, escalate to Browser MCP and explain why.
+2. Request focused search queries for discovery, avoiding duplicate broad queries.
+3. For evidence-heavy answers, fetch the best 1-3 result URLs and ground the final answer in fetched text plus snippets.
+4. Summarize the answer from retrieved content and include source URLs when available.
+5. If a page cannot be fetched but the user needs rendered UI state, escalate to Browser MCP and explain why.
 
 ## Usage
 

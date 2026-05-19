@@ -992,6 +992,18 @@ const App: React.FC = () => {
                                        </p>
                                      </div>
                                    )}
+                                   {msg.magiData.continuation && (
+                                     <div className="mt-5 border-t border-magi-balthasar/40 pt-4">
+                                       <div className="text-[10px] text-magi-balthasar uppercase tracking-[0.3em] font-bold mb-2">Continuation</div>
+                                       <div className="text-sm md:text-base leading-relaxed text-gray-300 font-mono">
+                                         <div className="text-magi-balthasar uppercase text-[10px] tracking-widest">{msg.magiData.continuation.reason}</div>
+                                         <p className="mt-2">{msg.magiData.continuation.message}</p>
+                                         {msg.magiData.continuation.nextStep && (
+                                           <p className="mt-2 text-gray-400">{msg.magiData.continuation.nextStep}</p>
+                                         )}
+                                       </div>
+                                     </div>
+                                   )}
                                    {msg.magiData.auditRef && (
                                      <div className="mt-5 border-t border-gray-800 pt-4">
                                        <div className="text-[10px] text-magi-dim uppercase tracking-[0.3em] font-bold mb-2">Audit Log</div>

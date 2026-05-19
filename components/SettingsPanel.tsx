@@ -5,11 +5,12 @@ import {
   HarnessDocuments,
   HarnessSettings,
   MagiSystem,
+  ModelSaddleId,
   ReasoningEffort,
   ToolAccessKey,
   ToolAccessMode,
 } from '../types';
-import { DEFAULT_RUNTIME_BUDGETS, HARNESS_DOCUMENT_DEFINITIONS, TOOL_ACCESS_DEFINITIONS, normalizeRuntimeBudgets, normalizeToolAccessMatrix } from '../services/harnessService';
+import { DEFAULT_RUNTIME_BUDGETS, HARNESS_DOCUMENT_DEFINITIONS, MODEL_SADDLE_PRESETS, TOOL_ACCESS_DEFINITIONS, normalizeRuntimeBudgets, normalizeToolAccessMatrix } from '../services/harnessService';
 import { testModelConnection } from '../services/aiService';
 import { BridgeStatus, getBridgeStatus, listMcpTools } from '../services/bridgeService';
 
@@ -39,9 +40,14 @@ const budgetControls: Array<{
   { key: 'councilToolMaxRequests', label: 'Council Tools', step: 1 },
   { key: 'synthesisToolMaxRequests', label: 'Synthesis Tools', step: 1 },
   { key: 'runtimeSuggestMaxRequests', label: 'Runtime Suggestions', step: 1 },
+  { key: 'actionLoopMaxRounds', label: 'Action Loop Rounds', step: 1 },
+  { key: 'actionLoopMaxRequestsPerRound', label: 'Loop Tools / Round', step: 1 },
+  { key: 'totalToolMaxRequests', label: 'Total Tools', step: 1 },
+  { key: 'jsonRepairMaxAttempts', label: 'JSON Repair Attempts', step: 1 },
   { key: 'toolAuditChars', label: 'Tool Audit Chars', step: 500 },
   { key: 'traceDetailsMaxChars', label: 'Trace Details Chars', step: 5000 },
 ];
+const saddleIds = Object.keys(MODEL_SADDLE_PRESETS) as ModelSaddleId[];
 
 const accessModeLabel: Record<ToolAccessMode, string> = {
   allow: 'ALLOW',
@@ -132,6 +138,17 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
     setTestMessage('');
   };
 
+  const applyModelSaddle = (saddleId: ModelSaddleId) => {
+    const preset = MODEL_SADDLE_PRESETS[saddleId];
+    setDraftSettings(prev => ({
+      ...prev,
+      modelSaddle: saddleId,
+      runtimeBudgets: preset.budgets,
+    }));
+    setTestState('idle');
+    setTestMessage(`${preset.label.toUpperCase()} SADDLE APPLIED`);
+  };
+
   const updateToolAccess = (systemType: MagiSystem, key: ToolAccessKey, mode: ToolAccessMode) => {
     setDraftSettings(prev => {
       const matrix = normalizeToolAccessMatrix(prev.toolAccess);
@@ -205,6 +222,34 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({
             placeholder="gpt-4.1-mini"
           />
         </label>
+
+        <div className="border border-magi-dim/30 bg-black p-2 space-y-2">
+          <div className="text-[10px] text-magi-balthasar uppercase tracking-wider font-bold">Model Saddle</div>
+          <div className="grid grid-cols-2 gap-2">
+            {saddleIds.map(saddleId => {
+              const preset = MODEL_SADDLE_PRESETS[saddleId];
+              const active = draftSettings.modelSaddle === saddleId;
+              return (
+                <button
+                  key={saddleId}
+                  type="button"
+                  title={preset.description}
+                  onClick={() => applyModelSaddle(saddleId)}
+                  className={`border p-2 text-left transition-colors ${
+                    active
+                      ? 'border-magi-balthasar bg-magi-balthasar text-black'
+                      : 'border-magi-dim/40 text-gray-300 hover:border-white hover:text-white'
+                  }`}
+                >
+                  <div className="text-[10px] font-bold uppercase tracking-wider">{preset.label}</div>
+                  <div className={`mt-1 text-[9px] leading-snug ${active ? 'text-black/70' : 'text-magi-dim'}`}>
+                    {preset.description}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
 
         <label className="block space-y-1">
           <span className="text-[10px] text-magi-dim uppercase tracking-wider">Tavily Key</span>

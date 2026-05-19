@@ -6,6 +6,7 @@ export enum MagiSystem {
 
 export type Language = 'EN' | 'CN';
 export type ReasoningEffort = 'low' | 'medium' | 'high';
+export type ModelSaddleId = 'deepseek-v4-1m' | 'large-context' | 'balanced' | 'fast';
 export type ToolAccessMode = 'allow' | 'review' | 'deny';
 export type ToolAccessKey =
   | 'web.search.tavily'
@@ -80,6 +81,7 @@ export interface HarnessSettings {
   baseURL: string;
   modelName: string;
   tavilyApiKey: string;
+  modelSaddle: ModelSaddleId;
   reasoningEnabled: boolean;
   reasoningEffort: ReasoningEffort;
   runtimeBudgets: RuntimeBudgetSettings;
@@ -98,6 +100,10 @@ export interface RuntimeBudgetSettings {
   councilToolMaxRequests: number;
   synthesisToolMaxRequests: number;
   runtimeSuggestMaxRequests: number;
+  actionLoopMaxRounds: number;
+  actionLoopMaxRequestsPerRound: number;
+  totalToolMaxRequests: number;
+  jsonRepairMaxAttempts: number;
   toolAuditChars: number;
   traceDetailsMaxChars: number;
 }
@@ -125,6 +131,7 @@ export interface ToolTrace {
   query?: string;
   summary?: string;
   details?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface SessionTraceStep {
@@ -258,6 +265,11 @@ export interface MagiResponse {
   streamEvents?: StreamEvent[];
   auditRef?: AuditRef;
   requiresUserInput?: boolean;
+  continuation?: {
+    reason: 'budget_exhausted' | 'pending_approval' | 'clarification_required' | 'error';
+    message: string;
+    nextStep?: string;
+  };
 }
 
 export interface Message {

@@ -121,7 +121,17 @@ interface RuntimeMcpServerTools {
 interface RuntimeCapabilities {
   bridge?: BridgeStatus;
   mcpServers: RuntimeMcpServerTools[];
+  loadedSkills?: RuntimeLoadedSkill[];
   errors: string[];
+}
+
+interface RuntimeLoadedSkill {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  score: number;
+  reason: string;
 }
 
 const systemConfigs: Record<MagiSystem, SystemConfig> = {
@@ -175,6 +185,22 @@ const safeParse = (text: string, archetype?: string) => {
     );
     throw new Error('Invalid JSON response from model');
   }
+};
+
+const tryParseJsonObject = (text: string) => {
+  let cleaned = text.trim();
+  if (cleaned.includes('```')) {
+    cleaned = cleaned.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
+  }
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+  }
+  const parsed = JSON.parse(cleaned);
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : {};
 };
 
 const withTimeout = <T>(promise: Promise<T>, ms: number) =>
@@ -234,6 +260,69 @@ const createChatParams = (
 };
 
 const getRuntimeBudgets = (settings: HarnessSettings) => normalizeRuntimeBudgets(settings.runtimeBudgets);
+
+const requestJsonObject = async (
+  client: OpenAI,
+  settings: HarnessSettings,
+  modelName: string,
+  label: string,
+  promptText: string,
+  options: {
+    maxTokens: number;
+    retryMaxTokens?: number;
+    temperature?: number;
+    repairInstruction?: string;
+    onRetry?: (attempt: number, reason: string, preview?: string) => void;
+  },
+) => {
+  const budgets = getRuntimeBudgets(settings);
+  let lastText = '';
+  let lastReason = 'unknown';
+  const attempts = Math.max(1, budgets.jsonRepairMaxAttempts + 1);
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const isRepair = attempt > 0;
+    const content = isRepair
+      ? `${options.repairInstruction || 'Repair the previous invalid JSON response.'}
+
+Return one valid JSON object only. No markdown, no commentary.
+
+## Original Task
+${promptText}
+
+## Invalid Previous Response
+${truncateForPrompt(lastText || '[empty response]', 6000)}
+
+## Failure
+${lastReason}`
+      : promptText;
+    if (isRepair) options.onRetry?.(attempt, lastReason, truncateForPrompt(lastText || '', 500));
+
+    const response = await client.chat.completions.create(createChatParams(settings, {
+      model: modelName,
+      messages: [{ role: 'system', content }],
+      temperature: isRepair ? 0.1 : options.temperature ?? 0.6,
+      max_tokens: isRepair ? options.retryMaxTokens || options.maxTokens : options.maxTokens,
+      response_format: { type: 'json_object' },
+    }) as any);
+
+    const text = response.choices[0]?.message?.content || '';
+    lastText = text;
+    if (!text.trim()) {
+      lastReason = `${label} Silence`;
+      continue;
+    }
+
+    try {
+      return tryParseJsonObject(text);
+    } catch (error) {
+      lastReason = error instanceof Error ? error.message : 'Invalid JSON response from model';
+    }
+  }
+
+  console.warn(`【${label}】JSON failed after repair attempts. ${truncateForPrompt(lastText.replace(/\s+/g, ' '), 500)}`);
+  throw new Error(lastReason.includes('Silence') ? lastReason : 'Invalid JSON response from model');
+};
 
 export const testModelConnection = async (settings: HarnessSettings) => {
   const startedAt = Date.now();
@@ -770,11 +859,109 @@ const extractMcpTools = (payload: unknown): RuntimeMcpTool[] => {
 };
 
 const actionIntentPattern = /价格|当前|实时|报价|行情|查询|查|多少|price|quote|current|fetch|lookup|run|执行|获取/i;
+const marketQuoteIntentPattern = /股价|股票|股票代码|行情|报价|证券|美股|港股|a股|沪市|深市|比特币|价格|price|quote|ticker|stock|share price|btc|bitcoin|crypto/i;
 
 const getSkillActions = (runtime: RuntimeCapabilities | undefined) =>
   runtime?.bridge?.skills.flatMap(skill =>
     (skill.actions || []).map(action => ({ skill, action })),
   ) || [];
+
+const skillKeywordHints: Record<string, string[]> = {
+  'web-retrieval': ['web', 'search', 'fetch', 'lookup', 'news', 'weather', 'url', 'http', 'docs', 'documentation', '网页', '搜索', '检索', '联网', '查询', '新闻', '资料', '读取', '抓取', '来源', '事实'],
+  'browser-verification': ['browser', 'ui', 'screenshot', 'dom', 'click', 'type', 'form', 'localhost', '127.0.0.1', '浏览器', '界面', '页面', '截图', '点击', '输入', '表单', '视觉', '本地页面'],
+  'market-quote': ['stock', 'quote', 'ticker', 'price', 'btc', 'bitcoin', '行情', '股价', '股票', '报价', '美股', '港股', 'a股', '比特币'],
+  'harness-engineering': ['harness', 'persona', 'memory', 'council', 'agent', 'trace', 'audit', 'settings', 'skill', 'tools', 'runtime', 'magi', '提示词', '人格', '记忆', '贤者', '审计', '设置', '权限', '重构', '范式'],
+  'mcp-tool-authoring': ['mcp', 'server', 'json-rpc', 'stdio', 'tool schema', 'filesystem', 'browser mcp', '工具', '服务器', '文件系统', '权限', '审批', '桥接'],
+};
+
+const tokenizeForSkillRouting = (value: string) =>
+  Array.from(new Set(
+    value
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}._:/-]+/gu, ' ')
+      .split(/\s+/)
+      .map(token => token.trim())
+      .filter(token => token.length >= 2),
+  ));
+
+const skillRoutingText = (skill: BridgeSkill) =>
+  `${skill.id} ${skill.name || ''} ${skill.description || ''} ${(skill.actions || []).map(action =>
+    `${action.id} ${action.description || ''} ${(action.triggers || []).join(' ')}`,
+  ).join(' ')}`;
+
+const scoreSkillRelevance = (
+  skill: BridgeSkill,
+  userQuery: string,
+  hasActionMatch: boolean,
+) => {
+  const query = userQuery.toLowerCase();
+  const routingText = skillRoutingText(skill).toLowerCase();
+  const queryTokens = tokenizeForSkillRouting(userQuery);
+  const routingTokens = new Set(tokenizeForSkillRouting(routingText));
+  const hints = skillKeywordHints[skill.id] || [];
+  let score = 0;
+  const reasons: string[] = [];
+
+  if (query.includes(skill.id.toLowerCase()) || (skill.name && query.includes(skill.name.toLowerCase()))) {
+    score += 30;
+    reasons.push('skill id/name mentioned');
+  }
+
+  const matchedTokens = queryTokens.filter(token => routingTokens.has(token));
+  if (matchedTokens.length > 0) {
+    score += Math.min(18, matchedTokens.length * 3);
+    reasons.push(`metadata overlap: ${matchedTokens.slice(0, 5).join(', ')}`);
+  }
+
+  const matchedHints = hints.filter(hint => query.includes(hint.toLowerCase()));
+  if (matchedHints.length > 0) {
+    score += Math.min(24, matchedHints.length * 6);
+    reasons.push(`routing hints: ${matchedHints.slice(0, 5).join(', ')}`);
+  }
+
+  if (skill.id === 'market-quote' && hasActionMatch) {
+    score += 16;
+    reasons.push('matching market quote action');
+  }
+
+  if (skill.id === 'web-retrieval' && /检索|搜索|联网|网页|资料|新闻|查询|读取网页|source|search|fetch|lookup|news|docs|url|http/i.test(userQuery)) {
+    score += 16;
+    reasons.push('retrieval task');
+  }
+
+  if (skill.id === 'browser-verification' && userQueryBlocksBrowserMcp(userQuery)) {
+    score -= 18;
+    reasons.push('browser explicitly blocked');
+  }
+
+  if (skill.id === 'market-quote' && /论文|aigc|ai率|检测|学术|工具|skill|范式/i.test(userQuery) && !/股价|股票|行情|报价|ticker|stock|btc|比特币/i.test(userQuery)) {
+    score -= 20;
+    reasons.push('not a market quote task');
+  }
+
+  return { score, reason: reasons.join('; ') || 'weak metadata match' };
+};
+
+const selectRelevantSkills = (
+  runtime: RuntimeCapabilities,
+  userQuery: string,
+  maxSkills = 3,
+) => {
+  const skills = runtime.bridge?.skills || [];
+  if (skills.length === 0) return [];
+  return skills
+    .map(skill => ({
+      skill,
+      ...scoreSkillRelevance(
+        skill,
+        userQuery,
+        (skill.actions || []).some(action => skillActionMatchesQuery(action, userQuery)),
+      ),
+    }))
+    .filter(item => item.score >= 10)
+    .sort((left, right) => right.score - left.score || left.skill.id.localeCompare(right.skill.id))
+    .slice(0, maxSkills);
+};
 
 const actionTriggersQuery = (action: SkillActionManifest, userQuery: string) => {
   const query = userQuery.toLowerCase();
@@ -864,7 +1051,11 @@ const extractSkillActionSymbol = (action: SkillActionManifest, userQuery: string
 const skillActionMatchesQuery = (action: SkillActionManifest, userQuery: string) => {
   if (actionTriggersQuery(action, userQuery)) return true;
   const symbol = extractSkillActionSymbol(action, userQuery);
-  return Boolean(symbol) && actionIntentPattern.test(userQuery);
+  const actionText = `${action.description || ''} ${(action.triggers || []).join(' ')}`.toLowerCase();
+  const intentPattern = /stock|quote|ticker|股价|股票|行情|报价|比特币/.test(actionText)
+    ? marketQuoteIntentPattern
+    : actionIntentPattern;
+  return Boolean(symbol) && intentPattern.test(userQuery);
 };
 
 const shouldExpandRuntimeManifest = (userQuery: string) =>
@@ -925,6 +1116,67 @@ const loadRuntimeCapabilities = async (
   }
 };
 
+const loadRelevantSkillInstructions = async (
+  runtime: RuntimeCapabilities,
+  userQuery: string,
+  onEvent?: QueryMagiOptions['onEvent'],
+) => {
+  const selected = selectRelevantSkills(runtime, userQuery, 3);
+  if (selected.length === 0) return [];
+
+  const loaded: RuntimeLoadedSkill[] = [];
+  for (const item of selected) {
+    try {
+      emitStreamEvent(
+        [],
+        onEvent,
+        'skill-router',
+        'HARNESS',
+        'running',
+        `Loading ${item.skill.id} SKILL.md (${item.reason}).`,
+      );
+      const result = await executeBridgeTool('skill.run', {
+        skill: item.skill.id,
+        mode: 'load',
+        task: `Load SKILL.md because this skill is relevant to the user request: ${item.reason}`,
+      }, 'HARNESS');
+      const skillResult = result.result as {
+        content?: unknown;
+        skill?: { id?: unknown; name?: unknown; description?: unknown };
+      };
+      const content = typeof skillResult.content === 'string' ? skillResult.content : '';
+      if (!content.trim()) continue;
+      loaded.push({
+        id: item.skill.id,
+        name: item.skill.name,
+        description: item.skill.description,
+        content,
+        score: item.score,
+        reason: item.reason,
+      });
+      emitStreamEvent(
+        [],
+        onEvent,
+        'skill-router',
+        'HARNESS',
+        'complete',
+        `Loaded ${item.skill.id} SKILL.md.`,
+      );
+    } catch (error) {
+      emitStreamEvent(
+        [],
+        onEvent,
+        'skill-router',
+        'HARNESS',
+        'failed',
+        `Failed to load ${item.skill.id} SKILL.md.`,
+        error instanceof Error ? error.message : 'Unknown skill load error',
+      );
+    }
+  }
+  return loaded;
+};
+
 const compactSkill = (skill: BridgeSkill) => {
   const description = truncateForPrompt(skill.description || 'No description.', 220).replace(/\s+/g, ' ');
   const actions = skill.actions?.length
@@ -938,6 +1190,15 @@ const compactSkillAction = (skill: BridgeSkill, action: SkillActionManifest) => 
   const script = action.script ? ` script=${action.script}` : '';
   const triggers = action.triggers?.length ? ` triggers=${action.triggers.slice(0, 8).join('|')}` : '';
   return `- ${skill.id}.${action.id}: ${description}; tool=${action.toolId}; mode=${action.mode || 'load'}${script}; risk=${action.risk || 'medium'}; readOnly=${Boolean(action.readOnly)}${triggers}`;
+};
+
+const compactLoadedSkill = (skill: RuntimeLoadedSkill) => {
+  const body = truncateForPrompt(skill.content, 4500);
+  return `### ${skill.id} (score=${skill.score})
+Reason: ${skill.reason}
+Description: ${skill.description || 'No description.'}
+
+${body}`;
 };
 
 const compactMcpTool = (tool: RuntimeMcpTool) => {
@@ -984,6 +1245,9 @@ const formatRuntimeCapabilities = (runtime: RuntimeCapabilities, expanded: boole
       .slice(0, expanded ? 30 : 12)
       .join('\n')
     : '';
+  const loadedSkills = runtime.loadedSkills?.length
+    ? runtime.loadedSkills.map(compactLoadedSkill).join('\n\n')
+    : 'NO SKILL.md INSTRUCTIONS PRELOADED FOR THIS QUERY.';
 
   const hasFilesystem = runtime.mcpServers.some(server => server.server === 'filesystem');
   const hasBrowser = runtime.mcpServers.some(server => server.server === 'browser');
@@ -1024,6 +1288,9 @@ Bridge: ${bridgeLine}
 ## Runtime Skills Available via skill.run load
 ${skills}
 
+## Relevant Skill Instructions Loaded From SKILL.md
+${loadedSkills}
+
 ## Runtime Skill Actions
 ${skillActions || 'NO MACHINE-READABLE SKILL ACTIONS DISCOVERED.'}
 
@@ -1033,7 +1300,8 @@ ${mcpServers}
 ## Tool-Use Rules From Runtime
 
 - Web retrieval route: use web_search_tavily for search/discovery and web_fetch for reading a known URL. This covers weather, news, general lookup, docs pages, and retrieval/crawling tasks.
-- Skill action route: when Runtime Skill Actions list a matching read-only script action, prefer that action over improvising API calls. Use the action's script, arguments, freshness fields, and fallback guidance from SKILL.md.
+- SKILL.md route: loaded skill instructions are first-class operational guidance. Follow their Capability, Boundaries, Tool Route, Workflow, and Examples even when they have no actions.json.
+- Skill action route: when Runtime Skill Actions list a matching read-only script action, treat it as an optional fast path compiled from the skill, not as the skill itself. Use it only when the loaded/available skill boundary says the task fits.
 - Browser MCP route: use browser tools only for real browser state: local UI inspection, current page DOM, screenshots, streaming UI checks, visual layout verification, click/type interaction, or form workflows.
 - If the user says no browser or no screenshot, that is a hard routing signal: use retrieval tools instead of Browser MCP.
 ${toolUseRules}
@@ -1524,11 +1792,6 @@ const getMatchingSkillActionRequests = (
     .filter((request): request is PlannedToolRequest => Boolean(request));
 });
 
-const hasMatchingSkillActions = (
-  runtime: RuntimeCapabilities | undefined,
-  userQuery: string,
-) => getSkillActions(runtime).some(({ action }) => skillActionMatchesQuery(action, userQuery));
-
 const annotateSkillActionRequest = (
   request: PlannedToolRequest,
   runtime: RuntimeCapabilities | undefined,
@@ -2010,15 +2273,16 @@ Call only tools that are directly useful and permissioned by the registry and To
 
 Important:
 - The Authoritative Runtime Tool Manifest is live. Trust it over stale memory.
-- Action is available throughout the whole run: analysis, council, synthesis, and approved execution. This is only the first chance to act.
+- Action is available throughout the run: independent analysis, council exchange, action-loop, and approved execution. This is only the first chance to act.
 - When a low-risk tool can answer or verify the task, request it now instead of proposing that the user approve a future test.
 - For information retrieval such as weather, news, factual lookup, docs discovery, or reading a known URL, use web_search_tavily or web_fetch. Do not use Browser MCP for retrieval-only tasks.
 - Use Browser MCP only when the task needs real browser state: local UI inspection, current page DOM, screenshot, click/type interaction, streaming UI verification, or visual layout checks.
 - If the user explicitly says they do not need a browser or screenshot, do not call mcp_call with server="browser".
 - If the user asks about local code, files, repo structure, or whether MAGI can access the project, use filesystem MCP when it is listed.
 - Do not answer "browser sandbox cannot access filesystem" when bridge is online and filesystem MCP tools are listed. Request mcp.call instead.
-- If the user asks for skill details and a matching runtime skill is listed, request skill.run with mode "load".
-- If Runtime Skill Actions include a matching read-only script action, use the action's declared script and arguments instead of inventing a one-off route.
+- Relevant SKILL.md files may already be loaded in the runtime block. Treat those Markdown instructions as the primary skill guidance and follow their Tool Route/Boundaries.
+- Do not call skill_run mode="load" for an already loaded skill unless the user asks to inspect the raw skill file.
+- If Runtime Skill Actions include a matching read-only script action, use it only when the loaded/available skill boundary says the task fits. Actions are fast paths, not the whole skill.
 
 Concrete examples when filesystem MCP is available:
 - repository root: call mcp_call with server="filesystem", tool="list_directory", arguments={ "path": "." }
@@ -2372,6 +2636,7 @@ ${contextStr || 'NO PRIOR CONVERSATION.'}
 
 ## Current Task
 Analyze the current user query from your persona's mandate. Use available memory, tool results, skills registry, and MCP registry as operational context.
+Apply the Skeptical Duty in your persona contract as part of your own judgment; do not wait for synthesis to do this for you.
 
 You may propose documentOperations only for:
 - ${getPersonaMemoryDocumentId(systemType)}
@@ -2394,18 +2659,28 @@ User query: "${userQuery}"
 
   try {
     emitStreamEvent(streamEvents, onEvent, 'persona', config.name, 'running', 'Composing independent analysis.');
-    const response = await client.chat.completions.create(createChatParams(harness.settings, {
-      model: modelName,
-      messages: [{ role: 'system', content: archetypePrompt }],
-      temperature: 0.7,
-      max_tokens: budgets.personaMaxTokens,
-      response_format: { type: 'json_object' },
-    }) as any);
-
-    const text = response.choices[0]?.message?.content;
-    if (!text) throw new Error(`${config.name} Silence.`);
-
-    const parsed = safeParse(text, config.name) as {
+    const parsed = await requestJsonObject(
+      client,
+      harness.settings,
+      modelName,
+      config.name,
+      archetypePrompt,
+      {
+        temperature: 0.7,
+        maxTokens: budgets.personaMaxTokens,
+        retryMaxTokens: budgets.meetingRetryMaxTokens,
+        repairInstruction: `You are ${config.name}. Repair your persona response into the requested schema.`,
+        onRetry: (attempt, reason, preview) => emitStreamEvent(
+          streamEvents,
+          onEvent,
+          'persona',
+          config.name,
+          'running',
+          `Retrying persona JSON response (${attempt}/${budgets.jsonRepairMaxAttempts}).`,
+          `${reason}\n${preview || ''}`,
+        ),
+      },
+    ) as {
       analysis?: string;
       proposal?: string;
       vote?: boolean;
@@ -2518,6 +2793,7 @@ Rules:
 - If a factual claim can be checked with an available read-only tool, call the tool.
 - Use web_search_tavily/web_fetch for retrieval-only questions. Use Browser MCP only for UI state, screenshots, DOM/page verification, or click/type interactions.
 - If the user explicitly says they do not need a browser or screenshot, do not call mcp_call with server="browser".
+- Follow any Relevant Skill Instructions already loaded in the runtime block. Do not reload those SKILL.md files unless raw inspection is needed.
 - Avoid repeating a tool call that already has a useful result in Tool Audit.
 - Risky click/type/write actions may be requested, but they will enter the approval queue.
 - Return no tool calls when no additional action is useful.
@@ -2540,7 +2816,7 @@ Rules:
   }
 };
 
-const planSynthesisTools = async (
+const planActionLoopTools = async (
   userQuery: string,
   language: Language,
   harness: MagiHarnessContext,
@@ -2566,7 +2842,7 @@ const planSynthesisTools = async (
   ).join('\n') || 'NO TOOL CALLS YET.';
 
   const promptText = `
-You are the MAGI council integrator immediately before final synthesis. The council has already discussed, but discussion is not a substitute for action.
+You are the MAGI council action-loop planner. The personas have already discussed, but discussion is not a substitute for useful, permitted action.
 
 ${langInstruction}
 
@@ -2596,10 +2872,11 @@ ${formatPendingActions(pendingActions)}
 Rules:
 - You have native function tools available: web_search_tavily, web_fetch, skill_run, mcp_call.
 - Tool calls must be permitted by registry.tools and at least one persona row in the Tool Access Matrix.
-- This is the final pre-answer action checkpoint. If a permitted tool can settle a remaining factual, file, browser, skill, or MCP uncertainty, request it now.
+- If a permitted tool can settle a remaining factual, file, browser, skill, or MCP uncertainty, request it now.
 - Do not ask the user for permission to run low-risk read-only tools. Call them.
 - Use web_search_tavily/web_fetch for retrieval-only questions. Use Browser MCP only for UI state, screenshots, DOM/page verification, or click/type interactions.
 - If the user explicitly says they do not need a browser or screenshot, do not call mcp_call with server="browser".
+- Follow any Relevant Skill Instructions already loaded in the runtime block. Treat actions.json as an optional fast path and SKILL.md as the real operating manual.
 - Avoid repeating useful tool calls already present in Tool Audit.
 - Risky click/type/write/execute actions may be requested, but they will become pending approvals.
 - Return no tool calls when the answer can already be grounded in existing tool results.
@@ -2607,7 +2884,7 @@ Rules:
 
   try {
     const planned = annotateSkillActionRequests(filterToolRequestsForUserIntent(
-      await planNativeToolCalls(client, modelName, harness.settings, promptText, 'SYNTHESIS TOOL PLANNER', budgets.synthesisToolMaxRequests),
+      await planNativeToolCalls(client, modelName, harness.settings, promptText, 'COUNCIL ACTION-LOOP TOOL PLANNER', budgets.synthesisToolMaxRequests),
       userQuery,
     ), runtime, userQuery);
     return prioritizeToolRequestsForUserIntent(planned
@@ -2617,7 +2894,7 @@ Rules:
     )
       .slice(0, budgets.synthesisToolMaxRequests);
   } catch (error) {
-    console.warn('[COUNCIL] Synthesis tool-planning step failed.', error);
+    console.warn('[COUNCIL] Action-loop tool-planning step failed.', error);
     return [];
   }
 };
@@ -2656,6 +2933,12 @@ const queryCouncilExchange = async (
 You are ${config.name} in the MAGI council meeting. This is the cross-examination round after independent thinking.
 
 ${langInstruction}
+
+## Your Persona Contract
+${harness.documents[getPersonaDocumentId(systemType)].content}
+
+## Your Persona Private Memory
+${harness.documents[getPersonaMemoryDocumentId(systemType)].content}
 
 ## Council Protocol
 ${harness.documents['council.protocol'].content}
@@ -2701,49 +2984,33 @@ Return JSON only:
 
   try {
     emitStreamEvent(streamEvents, onEvent, 'meeting', config.name, 'running', 'Entering council meeting round.');
-    let parsed: {
+    const parsed = await requestJsonObject(
+      client,
+      harness.settings,
+      modelName,
+      `${config.name} MEETING`,
+      promptText,
+      {
+        temperature: 0.6,
+        maxTokens: budgets.meetingMaxTokens,
+        retryMaxTokens: budgets.meetingRetryMaxTokens,
+        repairInstruction: `You are ${config.name}. Repair your council meeting response into the requested schema.`,
+        onRetry: (attempt, reason, preview) => emitStreamEvent(
+          streamEvents,
+          onEvent,
+          'meeting',
+          config.name,
+          'running',
+          `Retrying council JSON response (${attempt}/${budgets.jsonRepairMaxAttempts}).`,
+          `${reason}\n${preview || ''}`,
+        ),
+      },
+    ) as {
       content?: string;
       revisedProposal?: string;
       revisedVote?: boolean;
       clarificationRequests?: unknown;
-    } | undefined;
-    let lastError: unknown;
-
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        if (attempt > 0) {
-          emitStreamEvent(streamEvents, onEvent, 'meeting', config.name, 'running', 'Retrying compact council JSON response.');
-        }
-        const response = await client.chat.completions.create(createChatParams(harness.settings, {
-          model: modelName,
-          messages: [{
-            role: 'system',
-            content: attempt === 0
-              ? promptText
-              : `${promptText}\n\nRetry instruction: return a compact valid JSON object only. Keep content and revisedProposal short.`,
-          }],
-          temperature: attempt === 0 ? 0.6 : 0.2,
-          max_tokens: attempt === 0 ? budgets.meetingMaxTokens : budgets.meetingRetryMaxTokens,
-          response_format: { type: 'json_object' },
-        }) as any);
-
-        const text = response.choices[0]?.message?.content;
-        if (!text) throw new Error(`${config.name} meeting silence.`);
-        parsed = safeParse(text, `${config.name} MEETING`) as {
-          content?: string;
-          revisedProposal?: string;
-          revisedVote?: boolean;
-          clarificationRequests?: unknown;
-        };
-        break;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    if (!parsed) {
-      throw lastError instanceof Error ? lastError : new Error(`${config.name} meeting response failed.`);
-    }
+    };
 
     const exchange: CouncilExchange = {
       id: makeId('exchange'),
@@ -2812,8 +3079,9 @@ const streamFinalSynthesis = async (
     ? 'Output in Simplified Chinese.'
     : 'Output in English.';
 
-  const promptText = `
-You are the final MAGI council voice. Write the final user-facing answer only; do not return JSON.
+const promptText = `
+You are the final MAGI council voice-over. Write the final user-facing answer only; do not return JSON.
+Do not become a fourth persona, evidence filter, or separate skeptical layer. Preserve the council's substance and make it readable.
 
 ${langInstruction}
 
@@ -2845,6 +3113,7 @@ Rules:
 - If tool audit includes parsed quote JSON, copy the numeric price/source/quoteTime/freshness exactly from that JSON, even if the draft synthesis says something different.
 - If the user requested an exact marker, token, phrase, or output sentinel, include it verbatim and do not paraphrase it.
 - Preserve the substance of the structured council result.
+- Do not add new independent claims, objections, or tool needs that are absent from the structured council result, meeting, pending actions, or tool audit.
 `;
 
   emit('synthesis-stream', 'COUNCIL', 'running', 'Streaming final synthesis text.');
@@ -2941,6 +3210,10 @@ export const queryMagiSystem = async (
     streamEvents.push(event);
     options.onEvent?.(event);
   }, expandRuntimeManifest);
+  runtime.loadedSkills = await loadRelevantSkillInstructions(runtime, prompt, event => {
+    streamEvents.push(event);
+    options.onEvent?.(event);
+  });
   const runtimeBlock = formatRuntimeCapabilities(runtime, expandRuntimeManifest);
   trace.push(makeTraceStep(
     'runtime',
@@ -2950,6 +3223,15 @@ export const queryMagiSystem = async (
       ? `Bridge online: ${runtime.bridge.skills.length} skill(s), ${runtime.bridge.mcpServers.length} MCP server(s).`
       : `Bridge unavailable: ${runtime.errors.join('; ') || 'unknown error'}`,
     runtimeBlock,
+  ));
+  trace.push(makeTraceStep(
+    'skill-router',
+    'HARNESS',
+    'complete',
+    runtime.loadedSkills?.length
+      ? `Preloaded ${runtime.loadedSkills.length} relevant SKILL.md instruction file(s).`
+      : 'No relevant SKILL.md instruction files preloaded.',
+    runtime.loadedSkills?.map(skill => `${skill.id}: ${skill.reason}`).join('\n') || '',
   ));
 
   const runNode = async (systemType: MagiSystem) => {
@@ -3112,55 +3394,82 @@ export const queryMagiSystem = async (
     ));
   });
 
-  emit('synthesis-tools', 'COUNCIL', 'running', 'Checking whether final synthesis needs more tool action.');
-  const synthesisToolRequests = await planSynthesisTools(
-    prompt,
-    language,
-    harness,
-    runtime,
-    runtimeBlock,
-    initialOutputs,
-    meeting,
-    allToolTraces,
-    pendingActions,
-  );
-  const synthesisToolExecutions = await Promise.all(synthesisToolRequests.map(async request => {
-    const owner = getToolRequestOwner(request, harness);
-    return {
-      owner,
-      result: await executeToolRequests([request], owner, harness, event => {
-        streamEvents.push(event);
-        options.onEvent?.(event);
-      }),
-    };
-  }));
-  const synthesisToolCount = synthesisToolExecutions.reduce((sum, item) => sum + item.result.toolTraces.length, 0);
-  synthesisToolExecutions.forEach(item => {
-    allSources = dedupeSources([...allSources, ...item.result.sources]);
-    pendingActions = [...pendingActions, ...item.result.pendingActions];
-    allToolTraces = [...allToolTraces, ...item.result.toolTraces];
-    item.result.toolTraces.forEach(toolTrace => {
-      trace.push(makeTraceStep(
-        'synthesis-tool',
-        toolTrace.systemName,
-        toolTrace.status === 'failed'
-          ? 'failed'
-          : toolTrace.status === 'skipped'
-            ? 'skipped'
-            : toolTrace.status === 'pending'
-              ? 'waiting'
-              : 'complete',
-        `${toolTrace.toolId}: ${toolTrace.status}`,
-        toolTrace.details || toolTrace.query || toolTrace.summary,
-      ));
+  let actionLoopBudgetExhausted = false;
+  let actionLoopRoundsUsed = 0;
+  for (let round = 1; round <= budgets.actionLoopMaxRounds; round += 1) {
+    if (pendingActions.some(action => action.requiresApproval && action.status === 'pending')) {
+      emit('action-loop', 'COUNCIL', 'waiting', 'Action loop paused because approval is pending.');
+      break;
+    }
+
+    const remainingToolBudget = budgets.totalToolMaxRequests - allToolTraces.length;
+    if (remainingToolBudget <= 0) {
+      actionLoopBudgetExhausted = true;
+      emit('action-loop', 'COUNCIL', 'waiting', `Action loop tool budget exhausted (${budgets.totalToolMaxRequests}).`);
+      break;
+    }
+
+    emit('action-loop', 'COUNCIL', 'running', `Action loop round ${round}/${budgets.actionLoopMaxRounds}: checking for remaining executable work.`);
+    const loopRequests = (await planActionLoopTools(
+      prompt,
+      language,
+      harness,
+      runtime,
+      runtimeBlock,
+      initialOutputs,
+      meeting,
+      allToolTraces,
+      pendingActions,
+    )).slice(0, Math.min(budgets.actionLoopMaxRequestsPerRound, remainingToolBudget));
+
+    if (loopRequests.length === 0) {
+      emit('action-loop', 'COUNCIL', 'complete', round === 1 ? 'No additional action-loop work needed.' : 'Action loop converged with no additional tool calls.');
+      break;
+    }
+
+    actionLoopRoundsUsed = round;
+    const loopExecutions = await Promise.all(loopRequests.map(async request => {
+      const owner = getToolRequestOwner(request, harness);
+      return {
+        owner,
+        result: await executeToolRequests([request], owner, harness, event => {
+          streamEvents.push(event);
+          options.onEvent?.(event);
+        }),
+      };
+    }));
+
+    let loopToolCount = 0;
+    loopExecutions.forEach(item => {
+      loopToolCount += item.result.toolTraces.length;
+      allSources = dedupeSources([...allSources, ...item.result.sources]);
+      pendingActions = [...pendingActions, ...item.result.pendingActions];
+      allToolTraces = [...allToolTraces, ...item.result.toolTraces];
+      item.result.toolTraces.forEach(toolTrace => {
+        trace.push(makeTraceStep(
+          'action-loop',
+          toolTrace.systemName,
+          toolTrace.status === 'failed'
+            ? 'failed'
+            : toolTrace.status === 'skipped'
+              ? 'skipped'
+              : toolTrace.status === 'pending'
+                ? 'waiting'
+                : 'complete',
+          `${toolTrace.toolId}: ${toolTrace.status}`,
+          toolTrace.details || toolTrace.query || toolTrace.summary,
+        ));
+      });
     });
-  });
-  emit(
-    'synthesis-tools',
-    'COUNCIL',
-    'complete',
-    synthesisToolCount > 0 ? `${synthesisToolCount} synthesis-stage tool action(s) processed.` : 'No final tool action needed before synthesis.',
-  );
+
+    emit('action-loop', 'COUNCIL', 'complete', `Action loop round ${round} processed ${loopToolCount} tool action(s).`);
+    if (loopToolCount === 0) break;
+    if (allToolTraces.length >= budgets.totalToolMaxRequests) {
+      actionLoopBudgetExhausted = true;
+      emit('action-loop', 'COUNCIL', 'waiting', `Action loop stopped at total tool budget ${budgets.totalToolMaxRequests}.`);
+      break;
+    }
+  }
 
   const synthesisAllowedDocs = new Set<HarnessDocumentId>([
     'memory.shared',
@@ -3168,7 +3477,8 @@ export const queryMagiSystem = async (
   ]);
 
   const synthesisPrompt = `
-You are the MAGI council integrator. Three independent agents have deliberated. Your job is to converge, decide, and produce a bounded execution plan.
+You are the MAGI council voice-over. Three independent agents have deliberated and acted through the action-loop. Your job is to integrate their judgments, disagreement, tool results, pending actions, and continuation state into one user-facing answer.
+Do not become a fourth persona, evidence filter, or separate skeptical layer. If skepticism is needed, reflect what the personas already surfaced; do not invent new objections, claims, evidence rankings, or tool needs at synthesis time.
 
 ${langInstruction}
 
@@ -3217,6 +3527,11 @@ ${formatMeetingTranscript(meeting)}
 ## Pending Action Queue
 ${formatPendingActions(pendingActions)}
 
+## Runtime Budget Status
+Action loop rounds used: ${actionLoopRoundsUsed}/${budgets.actionLoopMaxRounds}
+Tool traces used: ${allToolTraces.length}/${budgets.totalToolMaxRequests}
+Budget exhausted: ${actionLoopBudgetExhausted ? 'yes' : 'no'}
+
 ## Tool Audit
 ${allToolTraces.map(trace => `${trace.systemName}:${trace.toolId}:${trace.status}:${trace.query || ''}:${trace.summary || ''}:${truncateForPrompt(trace.details || '', budgets.toolAuditChars)}`).join('\n') || 'NO TOOL CALLS.'}
 
@@ -3241,7 +3556,9 @@ Return JSON only:
 
 If the pending action queue is not empty, do not claim those actions have executed. Ask for approval in clarificationRequests when approval is required.
 If low-risk read-only tools have already run, answer from their results instead of asking whether to run them.
+Do not request or imply new tool work from synthesis. Any remaining executable work must be represented as continuation or a focused clarification, not as a hidden synthesis-stage action.
 If the next safe step depends on genuinely missing user intent, credentials, destructive changes, or a risky action approval, set requiresUserInput true and ask focused questions.
+If the runtime budget is exhausted before all useful safe work is finished, set requiresUserInput true and explain exactly what should continue next.
 If runtime bridge is online and filesystem MCP tools are listed, do not say the system cannot inspect local files. Instead summarize tool results or state which mcp.call should be approved/executed next.
 For market quote tasks, the source quote timestamp controls wording. If quote data is absent, stale, older than the current/latest trading session, or only from an old search snippet, do not call it "current", "real-time", or "实时"; state the shown timestamp and write "报价新鲜度: 未确认" or "stale".
 For tool results containing "Parsed quote result", copy the numeric price, source, quoteTime, currency, and freshness exactly from that parsed block. Do not substitute remembered prices, search snippets, or approximate market values.
@@ -3250,18 +3567,26 @@ If the user requested an exact marker, token, phrase, or output sentinel, preser
 `;
 
   emit('synthesis', 'COUNCIL', 'running', 'Integrating votes, meeting transcript, and action queue.');
-  const response = await client.chat.completions.create(createChatParams(harness.settings, {
-    model: modelName,
-    messages: [{ role: 'system', content: synthesisPrompt }],
-    temperature: 0.7,
-    max_tokens: budgets.synthesisMaxTokens,
-    response_format: { type: 'json_object' },
-  }) as any);
-
-  const text = response.choices[0]?.message?.content;
-  if (!text) throw new Error('Synthesis Silence.');
-
-  const synthesisResult = safeParse(text, 'SYNTHESIS') as {
+  const synthesisResult = await requestJsonObject(
+    client,
+    harness.settings,
+    modelName,
+    'SYNTHESIS',
+    synthesisPrompt,
+    {
+      temperature: 0.7,
+      maxTokens: budgets.synthesisMaxTokens,
+      retryMaxTokens: budgets.meetingRetryMaxTokens,
+      repairInstruction: 'Repair the MAGI synthesis response into the exact requested JSON schema.',
+      onRetry: (attempt, reason, preview) => emit(
+        'synthesis',
+        'COUNCIL',
+        'running',
+        `Retrying synthesis JSON response (${attempt}/${budgets.jsonRepairMaxAttempts}).`,
+        `${reason}\n${preview || ''}`,
+      ),
+    },
+  ) as {
     centralAnalysis?: string;
     synthesis?: string;
     executionPlan?: string;
@@ -3295,8 +3620,29 @@ If the user requested an exact marker, token, phrase, or output sentinel, preser
     .slice(0, 6);
 
   const requiresUserInput = Boolean(synthesisResult.requiresUserInput) ||
+    actionLoopBudgetExhausted ||
     pendingActions.some(action => action.requiresApproval && action.status === 'pending') ||
     clarificationRequests.some(request => request.required !== false);
+
+  const continuation: MagiResponse['continuation'] | undefined = actionLoopBudgetExhausted
+    ? {
+      reason: 'budget_exhausted',
+      message: `Action loop stopped after ${actionLoopRoundsUsed}/${budgets.actionLoopMaxRounds} round(s) and ${allToolTraces.length}/${budgets.totalToolMaxRequests} tool trace(s).`,
+      nextStep: synthesisResult.executionPlan || 'Continue the same task with remaining safe tool actions.',
+    }
+    : pendingActions.some(action => action.requiresApproval && action.status === 'pending')
+      ? {
+        reason: 'pending_approval',
+        message: `${pendingActions.filter(action => action.requiresApproval && action.status === 'pending').length} action(s) require approval before continuing.`,
+        nextStep: 'Approve or reject the pending actions.',
+      }
+      : clarificationRequests.some(request => request.required !== false)
+        ? {
+          reason: 'clarification_required',
+          message: 'The council needs user clarification before continuing.',
+          nextStep: clarificationRequests[0]?.question,
+        }
+        : undefined;
 
   const fallbackSynthesis = synthesisResult.synthesis || 'NO SYNTHESIS RETURNED.';
   const finalSynthesis = await streamFinalSynthesis(
@@ -3411,5 +3757,6 @@ If the user requested an exact marker, token, phrase, or output sentinel, preser
     streamEvents,
     auditRef,
     requiresUserInput,
+    continuation,
   };
 };

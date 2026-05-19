@@ -356,6 +356,7 @@ const summarizeResponse = (response, streamEvents, textDeltaCount, latencyMs) =>
     toolStatus: countBy(toolTraces.map(trace => trace.status)),
     pendingActions: response.pendingActions?.length || 0,
     clarifications: response.clarificationRequests?.length || 0,
+    continuation: response.continuation || null,
     offlinePersonas,
     failedEvents,
     auditRef: response.auditRef,
@@ -387,6 +388,9 @@ const printTextReport = (report, streamed) => {
   }
   if (report.summary.auditRef?.filePath) {
     process.stdout.write(`Audit: ${report.summary.auditRef.filePath}\n`);
+  }
+  if (report.summary.continuation) {
+    process.stdout.write(`Continuation: ${report.summary.continuation.reason} - ${report.summary.continuation.message}\n`);
   }
   process.stdout.write('\nFinal synthesis:\n');
   process.stdout.write(`${report.response.synthesis || '(empty)'}\n`);
@@ -719,7 +723,7 @@ const main = async () => {
       if (args.bridgeOnly || !args.full) return;
 
       args.expectTools.push(...(args.expectTools.length ? [] : ['mcp.call']));
-      args.expectPhases.push(...(args.expectPhases.length ? [] : ['council-tools', 'synthesis-tools', 'synthesis-stream']));
+      args.expectPhases.push(...(args.expectPhases.length ? [] : ['council-tools', 'action-loop', 'synthesis-stream']));
       args.expectTexts.push(...(args.expectTexts.length ? [] : ['MAGI_CAN_SEE_CODE_YES']));
       args.expectAudit = true;
       args.expectNoOffline = true;

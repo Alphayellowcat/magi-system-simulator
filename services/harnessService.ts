@@ -5,6 +5,7 @@ import {
   HarnessDocuments,
   HarnessSettings,
   MagiSystem,
+  ModelSaddleId,
   ReasoningEffort,
   RuntimeBudgetSettings,
   ToolAccessDefinition,
@@ -20,24 +21,54 @@ const DOCUMENTS_KEY = 'magi_harness_documents_v1';
 
 type HarnessDocumentDefinition = Omit<HarnessDocument, 'content'> & { fallback: string };
 
+const MELCHIOR_SKEPTICAL_DUTY = `## Skeptical Duty
+
+You own mechanism skepticism. For scientific, technical, academic, policy, medical, legal, financial, or other judgment-heavy claims:
+
+- Ask whether the claim is identifiable from the available data, not merely whether someone on the web asserts it.
+- Prefer mechanism, causal structure, math, reproducibility, and falsifiability over source popularity.
+- Distinguish observations from conclusions. A report, article, or search snippet is evidence candidate, not truth.
+- Name the key counterfactual: what result or example would prove this claim wrong?
+- If a tool or metric is said to measure something, check whether its observable features can actually identify that target.`;
+
+const BALTHASAR_SKEPTICAL_DUTY = `## Skeptical Duty
+
+You own incentive and harm skepticism. When evidence, tools, metrics, or authority claims appear persuasive, ask who benefits and who can be harmed.
+
+- Check whether the source, vendor, institution, or evaluator has a commercial, reputational, regulatory, or control incentive.
+- Look for false positives, false negatives, appeal paths, consent, auditability, and power asymmetry.
+- Distinguish "usable as a weak signal" from "safe as a decision basis".
+- Prefer reversible procedures and human review when a tool can punish people or distort incentives.
+- A protective objection should name the concrete harm mechanism and the smallest safer path.`;
+
+const CASPER_SKEPTICAL_DUTY = `## Skeptical Duty
+
+You own counterexample and framing skepticism. When the group starts converging too smoothly, look for the alternate frame that would make the answer wrong.
+
+- Ask whether the question's framing hides a better goal, missing option, or category error.
+- Search for counterexamples: cases that look similar but mean different things.
+- Notice language, culture, context, timing, and tacit incentives that a purely factual answer may flatten.
+- Challenge brittle consensus and web-page persuasion; a source can be true locally while misleading for the user's actual situation.
+- Turn doubt into a better framing or experiment, not vague hesitation.`;
+
 export const HARNESS_DOCUMENT_DEFINITIONS: HarnessDocumentDefinition[] = [
   {
     id: 'persona.melchior',
     label: 'MELCHIOR Persona',
     path: '/harness/personas/melchior.md',
-    fallback: '# MELCHIOR-1\n\nAnalytic intelligence. Protect truth and feasibility.',
+    fallback: `# MELCHIOR-1\n\nAnalytic intelligence. Protect truth and feasibility.\n\n${MELCHIOR_SKEPTICAL_DUTY}`,
   },
   {
     id: 'persona.balthasar',
     label: 'BALTHASAR Persona',
     path: '/harness/personas/balthasar.md',
-    fallback: '# BALTHASAR-2\n\nProtective intelligence. Protect people and stability.',
+    fallback: `# BALTHASAR-2\n\nProtective intelligence. Protect people and stability.\n\n${BALTHASAR_SKEPTICAL_DUTY}`,
   },
   {
     id: 'persona.casper',
     label: 'CASPER Persona',
     path: '/harness/personas/casper.md',
-    fallback: '# CASPER-3\n\nIntuitive intelligence. Protect desire, timing, and taste.',
+    fallback: `# CASPER-3\n\nIntuitive intelligence. Protect desire, timing, and taste.\n\n${CASPER_SKEPTICAL_DUTY}`,
   },
   {
     id: 'memory.shared',
@@ -67,7 +98,7 @@ export const HARNESS_DOCUMENT_DEFINITIONS: HarnessDocumentDefinition[] = [
     id: 'council.protocol',
     label: 'Council Protocol',
     path: '/harness/council.md',
-    fallback: '# Council Protocol\n\nThree independent agents deliberate, converge, and execute bounded operations.',
+    fallback: '# Council Protocol\n\nThree independent agents deliberate, act through permitted tools, and converge. The final synthesis is a voice-over/integrator, not a fourth persona or evidence filter.',
   },
   {
     id: 'registry.tools',
@@ -104,9 +135,101 @@ export const DEFAULT_RUNTIME_BUDGETS: RuntimeBudgetSettings = {
   councilToolMaxRequests: 3,
   synthesisToolMaxRequests: 4,
   runtimeSuggestMaxRequests: 8,
+  actionLoopMaxRounds: 4,
+  actionLoopMaxRequestsPerRound: 4,
+  totalToolMaxRequests: 32,
+  jsonRepairMaxAttempts: 2,
   toolAuditChars: 4000,
   traceDetailsMaxChars: 50000,
 };
+
+export const MODEL_SADDLE_PRESETS: Record<ModelSaddleId, {
+  id: ModelSaddleId;
+  label: string;
+  description: string;
+  budgets: RuntimeBudgetSettings;
+}> = {
+  'deepseek-v4-1m': {
+    id: 'deepseek-v4-1m',
+    label: 'DeepSeek v4 1M',
+    description: 'Large-context saddle for long tool traces, freer action loops, and deeper synthesis.',
+    budgets: DEFAULT_RUNTIME_BUDGETS,
+  },
+  'large-context': {
+    id: 'large-context',
+    label: 'Large Context',
+    description: 'Conservative large-context profile for long-window non-DeepSeek models.',
+    budgets: {
+      ...DEFAULT_RUNTIME_BUDGETS,
+      personaTimeoutMs: 240000,
+      personaMaxTokens: 12288,
+      synthesisMaxTokens: 24576,
+      actionLoopMaxRounds: 3,
+      totalToolMaxRequests: 24,
+    },
+  },
+  balanced: {
+    id: 'balanced',
+    label: 'Balanced',
+    description: 'General model saddle with moderate budgets and shorter loops.',
+    budgets: {
+      personaTimeoutMs: 180000,
+      plannerMaxTokens: 2048,
+      personaMaxTokens: 8192,
+      meetingMaxTokens: 4096,
+      meetingRetryMaxTokens: 2048,
+      synthesisMaxTokens: 16384,
+      finalStreamMaxTokens: 4096,
+      initialToolMaxRequests: 4,
+      councilToolMaxRequests: 2,
+      synthesisToolMaxRequests: 3,
+      runtimeSuggestMaxRequests: 6,
+      actionLoopMaxRounds: 2,
+      actionLoopMaxRequestsPerRound: 3,
+      totalToolMaxRequests: 16,
+      jsonRepairMaxAttempts: 2,
+      toolAuditChars: 2500,
+      traceDetailsMaxChars: 30000,
+    },
+  },
+  fast: {
+    id: 'fast',
+    label: 'Fast',
+    description: 'Small/flash model saddle for quick answers with tight tool and token budgets.',
+    budgets: {
+      personaTimeoutMs: 90000,
+      plannerMaxTokens: 1024,
+      personaMaxTokens: 4096,
+      meetingMaxTokens: 2048,
+      meetingRetryMaxTokens: 1024,
+      synthesisMaxTokens: 8192,
+      finalStreamMaxTokens: 2048,
+      initialToolMaxRequests: 2,
+      councilToolMaxRequests: 1,
+      synthesisToolMaxRequests: 2,
+      runtimeSuggestMaxRequests: 4,
+      actionLoopMaxRounds: 1,
+      actionLoopMaxRequestsPerRound: 2,
+      totalToolMaxRequests: 8,
+      jsonRepairMaxAttempts: 1,
+      toolAuditChars: 1200,
+      traceDetailsMaxChars: 12000,
+    },
+  },
+};
+
+const modelSaddleIds = Object.keys(MODEL_SADDLE_PRESETS) as ModelSaddleId[];
+
+export const inferModelSaddle = (modelName = '', baseURL = ''): ModelSaddleId => {
+  const text = `${modelName} ${baseURL}`.toLowerCase();
+  if (/deepseek.*v4|deepseek-v4|1m/.test(text)) return 'deepseek-v4-1m';
+  if (/flash|mini|small|lite|turbo/.test(text)) return 'fast';
+  if (/128k|200k|1m|long|large|claude|gpt-4\.1|gpt-5/.test(text)) return 'large-context';
+  return 'balanced';
+};
+
+export const isModelSaddleId = (value: unknown): value is ModelSaddleId =>
+  typeof value === 'string' && modelSaddleIds.includes(value as ModelSaddleId);
 
 const clampNumber = (value: unknown, fallback: number, min: number, max: number) => {
   const numeric = Number(value);
@@ -126,6 +249,10 @@ export const normalizeRuntimeBudgets = (budgets?: Partial<RuntimeBudgetSettings>
   councilToolMaxRequests: clampNumber(budgets?.councilToolMaxRequests, DEFAULT_RUNTIME_BUDGETS.councilToolMaxRequests, 0, 12),
   synthesisToolMaxRequests: clampNumber(budgets?.synthesisToolMaxRequests, DEFAULT_RUNTIME_BUDGETS.synthesisToolMaxRequests, 0, 12),
   runtimeSuggestMaxRequests: clampNumber(budgets?.runtimeSuggestMaxRequests, DEFAULT_RUNTIME_BUDGETS.runtimeSuggestMaxRequests, 1, 24),
+  actionLoopMaxRounds: clampNumber(budgets?.actionLoopMaxRounds, DEFAULT_RUNTIME_BUDGETS.actionLoopMaxRounds, 0, 12),
+  actionLoopMaxRequestsPerRound: clampNumber(budgets?.actionLoopMaxRequestsPerRound, DEFAULT_RUNTIME_BUDGETS.actionLoopMaxRequestsPerRound, 1, 12),
+  totalToolMaxRequests: clampNumber(budgets?.totalToolMaxRequests, DEFAULT_RUNTIME_BUDGETS.totalToolMaxRequests, 1, 96),
+  jsonRepairMaxAttempts: clampNumber(budgets?.jsonRepairMaxAttempts, DEFAULT_RUNTIME_BUDGETS.jsonRepairMaxAttempts, 0, 4),
   toolAuditChars: clampNumber(budgets?.toolAuditChars, DEFAULT_RUNTIME_BUDGETS.toolAuditChars, 800, 20000),
   traceDetailsMaxChars: clampNumber(budgets?.traceDetailsMaxChars, DEFAULT_RUNTIME_BUDGETS.traceDetailsMaxChars, 4000, 200000),
 });
@@ -228,28 +355,40 @@ export const normalizeToolAccessMatrix = (rawMatrix?: Partial<ToolAccessMatrix> 
   return defaults;
 };
 
-export const createDefaultHarnessSettings = (): HarnessSettings => ({
-  apiKey: '',
-  baseURL: process.env.OPENAI_BASE_URL || '',
-  modelName: process.env.OPENAI_MODEL_NAME || '',
-  tavilyApiKey: '',
-  reasoningEnabled: false,
-  reasoningEffort: 'medium',
-  runtimeBudgets: DEFAULT_RUNTIME_BUDGETS,
-  toolAccess: createDefaultToolAccessMatrix(),
-});
+export const createDefaultHarnessSettings = (): HarnessSettings => {
+  const baseURL = process.env.OPENAI_BASE_URL || '';
+  const modelName = process.env.OPENAI_MODEL_NAME || '';
+  const modelSaddle = inferModelSaddle(modelName, baseURL);
+  return {
+    apiKey: '',
+    baseURL,
+    modelName,
+    tavilyApiKey: '',
+    modelSaddle,
+    reasoningEnabled: false,
+    reasoningEffort: 'medium',
+    runtimeBudgets: MODEL_SADDLE_PRESETS[modelSaddle].budgets,
+    toolAccess: createDefaultToolAccessMatrix(),
+  };
+};
 
 export const normalizeHarnessSettings = (settings?: Partial<HarnessSettings> | null): HarnessSettings => {
   const defaults = createDefaultHarnessSettings();
   if (!settings || typeof settings !== 'object') return defaults;
+  const modelSaddle = isModelSaddleId(settings.modelSaddle)
+    ? settings.modelSaddle
+    : inferModelSaddle(settings.modelName || defaults.modelName, settings.baseURL || defaults.baseURL);
 
   return {
     ...defaults,
     ...settings,
+    modelSaddle,
     reasoningEffort: isReasoningEffort(settings.reasoningEffort)
       ? settings.reasoningEffort
       : defaults.reasoningEffort,
-    runtimeBudgets: normalizeRuntimeBudgets(settings.runtimeBudgets),
+    runtimeBudgets: settings.runtimeBudgets
+      ? normalizeRuntimeBudgets(settings.runtimeBudgets)
+      : MODEL_SADDLE_PRESETS[modelSaddle].budgets,
     toolAccess: normalizeToolAccessMatrix(settings.toolAccess),
   };
 };
@@ -305,6 +444,32 @@ const migrateHarnessDocument = (id: HarnessDocumentId, content: string) => {
     .replace(/本体代码不可见（filesystem MCP 状态以 Runtime Tool Manifest 为准）/g, '本体代码可见性以 Runtime Tool Manifest 为准；若 filesystem MCP 在线，应通过 mcp.call 读取')
     .replace(/本体代码不可见/g, '本体代码可见性以 Runtime Tool Manifest 为准')
     .replace(/MCP桥接状态待确认/g, 'MCP 桥接状态应以 Runtime Tool Manifest 为准');
+
+  if (id === 'persona.melchior' && !/## Skeptical Duty/.test(next)) {
+    next = `${next.trim()}\n\n${MELCHIOR_SKEPTICAL_DUTY}\n`;
+  }
+
+  if (id === 'persona.balthasar' && !/## Skeptical Duty/.test(next)) {
+    next = `${next.trim()}\n\n${BALTHASAR_SKEPTICAL_DUTY}\n`;
+  }
+
+  if (id === 'persona.casper' && !/## Skeptical Duty/.test(next)) {
+    next = `${next.trim()}\n\n${CASPER_SKEPTICAL_DUTY}\n`;
+  }
+
+  if (id === 'council.protocol') {
+    next = next
+      .replace(
+        /Action is not a single phase\. Any persona, meeting round, or synthesis pass may request permitted tools whenever a tool can clarify the task, verify a fact, inspect local state, or prepare an implementation\. Discussion should expose uncertainty; it must not replace available low-risk action\./g,
+        'Action is not a single phase. Any persona or meeting round may request permitted tools whenever a tool can clarify the task, verify a fact, inspect local state, or prepare an implementation. The action-loop may continue that work before the final answer. Discussion should expose uncertainty; it must not replace available low-risk action. The final synthesis is a voice-over/integrator, not a fourth persona or evidence filter.',
+      )
+      .replace(/4\. The synthesis pass may still request final verification before answering\./g, '4. If final verification is useful, the council/action-loop should do it before synthesis.')
+      .replace(/5\. The council synthesis integrates tool results, disagreement, pending actions, and clarification questions into one user-facing answer\./g, '5. The synthesis voice-over integrates tool results, disagreement, pending actions, and clarification questions into one user-facing answer without adding a new persona judgment.')
+      .replace(/A protective veto must be treated as a blocker unless the synthesis can name a safer equivalent path\./g, 'A protective veto must be treated as a blocker unless the council can name a safer equivalent path.')
+      .replace(/If two personas approve but the third identifies a missing fact, the synthesis should prefer an available verification tool before asking the user\./g, 'If two personas approve but the third identifies a missing fact, the council/action-loop should prefer an available verification tool before asking the user.')
+      .replace(/If all personas approve, the synthesis should still return a concrete execution plan\./g, 'If all personas approve, the synthesis voice-over should still return a concrete execution plan.')
+      .replace(/If any next action requires user intent, credentials, destructive local changes, or non-read MCP\/tool execution, the synthesis should wait for confirmation instead of pretending the action ran\./g, 'If any next action requires user intent, credentials, destructive local changes, or non-read MCP/tool execution, the synthesis voice-over should wait for confirmation instead of pretending the action ran.');
+  }
 
   if (id !== 'registry.tools') return next;
 
